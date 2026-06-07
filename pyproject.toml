@@ -7,10 +7,12 @@ name = "mls-infer-opt"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.12"
+# 评测容器为 NGC 镜像：Python 3.10 + torch 2.3(CUDA) + numpy 1.24。
+# 约束放宽到与之兼容，避免 pip 解析/构建在评测环境失败。
+requires-python = ">=3.10"
 dependencies = [
     "torch>=2.2",
-    "numpy>=1.26",
+    "numpy>=1.24",
     "openai>=1.40",
 ]
 

@@ -20,5 +20,15 @@ if [ -x ".venv/bin/python" ]; then
   PYTHON=".venv/bin/python"
 fi
 
+# --- 依赖自举 ---------------------------------------------------------------
+# 评测容器（NGC 镜像）已自带 torch(2.3, CUDA) / numpy / pytest；生产代码顶层第三方
+# 依赖只有 torch，openai 为 LLM 路径的懒加载可选依赖。这里只补 openai：
+#   - 不重装 torch（会拉到非 CUDA 轮子，破坏 GPU）；
+#   - 走清华镜像加速；openai 装不上时代码会优雅退回规则兜底，故失败仅告警、不中断评测。
+PIP_MIRROR="https://pypi.tuna.tsinghua.edu.cn/simple"
+"$PYTHON" -m pip install -q --no-input -i "$PIP_MIRROR" "openai>=1.40" 2>/dev/null || \
+  echo "[run.sh] warning: openai 安装失败，LLM 路径将退回规则兜底" >&2
+# ---------------------------------------------------------------------------
+
 "$PYTHON" -m mls_infer_opt.loop
 exit 0
