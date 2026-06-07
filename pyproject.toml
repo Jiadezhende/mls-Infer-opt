@@ -7,8 +7,12 @@ name = "mls-infer-opt"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.10"
-dependencies = []
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.2",
+    "numpy>=1.26",
+    "openai>=1.40",
+]
 
 [project.optional-dependencies]
 dev = [
@@ -22,7 +26,14 @@ packages = ["src/mls_infer_opt"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py312"
+# assets/ 是数据物料（generate: bootstrap 兜底 engine 源码；evaluate: vendored 参考实现），
+# 不是本包模块，故意保持无类型纯 PyTorch 风格，不纳入本仓库的 lint / typecheck。
+extend-exclude = [
+    "src/mls_infer_opt/generate/assets",
+    "src/mls_infer_opt/evaluate/assets",
+    "tests/assets",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
@@ -31,5 +42,16 @@ select = ["E", "F", "I", "UP", "B"]
 testpaths = ["tests"]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.12"
 strict = true
+exclude = [
+    "src/mls_infer_opt/generate/assets/",
+    "src/mls_infer_opt/evaluate/assets/",
+]
+
+# torch 的类型 stub 不完整，worker 侧大量 torch 调用会触发 strict 下的 untyped-call 噪声；
+# 这里只对 torch.* 放宽，不影响本包自身的严格检查。
+[[tool.mypy.overrides]]
+module = "torch.*"
+disallow_untyped_calls = false
+ignore_missing_imports = true
