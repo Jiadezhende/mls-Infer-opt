@@ -14,6 +14,7 @@ loop.finalize 发布；最后一条「原始 baseline」是这里的职责——
 
 from __future__ import annotations
 
+import os
 import platform
 import sys
 from pathlib import Path
@@ -76,7 +77,13 @@ def main() -> int:
     """装配并跑一次调优循环。无论发生什么都保证 engine.py 落盘并返回 0。"""
 
     environment, device = _probe_environment()
-    ctx = build_task_context(device=device, environment=environment)
+    ctx = build_task_context(
+        target_dir=os.environ.get("MLS_TARGET_DIR", "target"),
+        runs_dir=os.environ.get("MLS_RUNS_DIR", "runs"),
+        output_dir=os.environ.get("MLS_OUTPUT_DIR", "workspace"),
+        device=device,
+        environment=environment,
+    )
     try:
         run_loop(ctx, llm=_build_llm(), hooks=LoopHooks(), config=LoopConfig())
     except Exception as e:  # noqa: BLE001 — run_loop 之外的最后一道防线
