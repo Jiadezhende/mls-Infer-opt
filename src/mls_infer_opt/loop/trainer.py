@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import shutil
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -614,14 +616,55 @@ def _emit(
 ) -> None:
     payload = dict(data or {})
     payload.setdefault("round", state.round)
-    state.add_event(
-        AgentEvent(
-            source="loop",
-            phase=phase,
-            message=message,
-            level=level,
-            candidate_id=candidate_id,
-            ts=utcnow_iso(),
-            data=payload,
-        )
+    event = AgentEvent(
+        source="loop",
+        phase=phase,
+        message=message,
+        level=level,
+        candidate_id=candidate_id,
+        ts=utcnow_iso(),
+        data=payload,
     )
+    state.add_event(event)
+    _stream_event(event)
+
+
+# 关键字段：实时行只点出这几个高频指标，其余仍完整落在 results.log / report3.json。
+_STREAM_KEYS = ("passed", "score", "best_score", "stop_reason", "attempt", "published")
+
+
+def _stream_enabled() -> bool:
+    """事件是否实时打到终端。默认开；``MLS_LOG_STREAM=0`` 关掉（如不想污染日志通道）。
+
+    每次读 env、不缓存：测试可临时改 env 验证两种行为，run.sh 在进程启动前设一次即可。
+    """
+
+    return os.environ.get("MLS_LOG_STREAM", "1").strip().lower() not in ("0", "false", "no", "")
+
+
+def _stream_event(event: AgentEvent) -> None:
+    """把单条事件实时写 stderr，给评测终端逐轮反馈。best-effort，绝不抛、绝不拖垮 loop。
+
+    走 stderr 而非 stdout：与崩溃日志同通道，且不碰 worker↔parent 的 stdout 结果管道。
+    完整事件流仍由 finalize 落到 results.log，这里只是过程中的可观测性补充。
+    """
+
+    if not _stream_enabled():
+        return
+    try:
+        rnd = event.data.get("round")
+        prefix = f"[r{rnd}]" if rnd is not None else "[--]"
+        cid = f" {event.candidate_id}" if event.candidate_id else ""
+        bits = [
+            f"{k}={event.data[k]}"
+            for k in _STREAM_KEYS
+            if event.data.get(k) is not None
+        ]
+        extra = f"  ({', '.join(bits)})" if bits else ""
+        print(
+            f"{prefix} {event.level:<7} {event.phase}:{cid} {event.message}{extra}",
+            file=sys.stderr,
+            flush=True,
+        )
+    except Exception:  # noqa: BLE001 — 可观测性是尽力而为，写不出去也不能影响主流程
+        pass
