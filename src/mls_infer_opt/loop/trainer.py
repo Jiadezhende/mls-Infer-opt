@@ -162,9 +162,9 @@ def run_loop(
     hooks = hooks or LoopHooks()
     config = config or LoopConfig()
     state = LoopState(task_context=ctx)
-    state.on_event(stream_event)  # 进程边缘装观察者：此后每条事件实时流到 stderr
     started = time.monotonic()
     _ensure_dirs(ctx)
+    _install_observer(state)  # 每条事件实时(a)流 stderr、(b)增量 append results.log
     _emit(state, "loop 启动", "init", data={"run_id": ctx.run_id})
 
     try:
@@ -274,6 +274,7 @@ def keep_best(state: LoopState, candidate: Candidate) -> bool:
             level="warning",
             candidate_id=candidate.id,
         )
+    _publish_summary(state)  # output3.json 随 best 同步刷新（与 engine.py 同时发布）
     return True
 
 
@@ -605,6 +606,41 @@ def _summary(state: LoopState) -> dict[str, Any]:
     }
 
 
+def _install_observer(state: LoopState) -> None:
+    """装事件观察者：每条事件实时 (a) 流 stderr、(b) 增量 append 到发布根的 results.log。
+
+    增量写让 results.log 在被 Ctrl-C / SIGTERM / 评测墙中途 kill 时也已落到最新一条，不必等
+    finalize（与 engine.py 增量发布同一抗 kill 哲学）。先清空同 output_dir 里上一个 run 的残留，
+    再逐条 append；写盘失败则降级为仅 stderr。
+    """
+    log_path: Path | None = Path(state.task_context.paths.output_dir) / "results.log"
+    try:
+        log_path.write_text("", encoding="utf-8")
+    except OSError:
+        log_path = None
+
+    def _sink(event: AgentEvent) -> None:
+        stream_event(event)
+        if log_path is not None:
+            present.append_event(log_path, event)
+
+    state.on_event(_sink)
+
+
+def _publish_summary(state: LoopState) -> None:
+    """把 output3.json 同步写到发布根（随 best 刷新即更新，与 engine.py 同时发布，抗中途 kill）。
+
+    best 在 keep_best 里增量发布 engine.py，这里跟着把摘要也写出去，使任意中断点 output3.json
+    都反映「当前最优」。finalize 仍会用完整状态覆盖一遍作权威终发。never-throw。
+    """
+    try:
+        out = Path(state.task_context.paths.output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "output3.json").write_text(_json_dump(_summary(state)), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def _write_artifacts(state: LoopState, *, enabled: bool) -> None:
     if not enabled:
         return
@@ -639,19 +675,10 @@ def _json_safe(value: Any) -> Any:
 
 
 def _render_events(state: LoopState) -> str:
-    """results.log：每条事件一行表头（保持旧格式、可 grep），其下缩进渲染 event.data 明细。
-
-    旧版只打 message、把 data 整段丢掉——rationale / 策略 delta / 分数分量因此全不可见。这里靠
-    present.format_data_block 把那些「已采集但被丢」的信号补回来，让验收者看懂每轮为何这么决策。
-    """
-    lines = []
-    for event in state.events:
-        cid = f" candidate={event.candidate_id}" if event.candidate_id else ""
-        lines.append(
-            f"[{event.ts}] {event.level} {event.source}.{event.phase}:{cid} {event.message}"
-        )
-        lines.extend(present.format_data_block(event))
-    return "\n".join(lines) + ("\n" if lines else "")
+    """results.log 全量渲染（finalize 用）。与增量 append 走同一 present.render_event，格式一致。"""
+    if not state.events:
+        return ""
+    return "\n".join(present.render_event(e) for e in state.events) + "\n"
 
 
 def _emit(

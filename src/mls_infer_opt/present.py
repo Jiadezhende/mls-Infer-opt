@@ -20,6 +20,8 @@ __all__ = [
     "speedup",
     "fmt_score_line",
     "format_data_block",
+    "render_event",
+    "append_event",
     "fmt_banner",
     "fmt_acceptance",
 ]
@@ -146,6 +148,22 @@ def format_data_block(event: Any) -> list[str]:
         return lines
     except Exception:  # noqa: BLE001
         return []
+
+
+def render_event(event: Any) -> str:
+    """单条事件 → results.log 文本：表头行（可 grep）+ 缩进数据块。不含尾换行。"""
+    cid = f" candidate={event.candidate_id}" if getattr(event, "candidate_id", None) else ""
+    head = f"[{event.ts}] {event.level} {event.source}.{event.phase}:{cid} {event.message}"
+    return "\n".join([head, *format_data_block(event)])
+
+
+def append_event(path: Any, event: Any) -> None:
+    """把一条事件实时 append 到 results.log（每次 open/close，落盘即抗中途 kill）。never-throw。"""
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(render_event(event) + "\n")
+    except OSError:
+        pass
 
 
 def fmt_banner(state: Any) -> str:
