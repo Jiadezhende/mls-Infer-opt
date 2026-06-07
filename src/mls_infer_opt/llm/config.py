@@ -89,7 +89,7 @@ class LLMConfig:
     model: str = "gpt-5.5"
     api_key: str | None = None
     base_url: str | None = None
-    timeout_s: float = 60.0
+    timeout_s: float = 120.0  # 产一份 engine.py 实测 ~80s（reasoning 模型），留足余量
     max_tool_rounds: int = 4
     disabled: bool = False
 
@@ -110,7 +110,7 @@ class LLMConfig:
                 or values.get("OPENAI_BASE_URL")
                 or values.get("OPENAI_API_BASE")
             ),
-            timeout_s=_float_env(values, "MLS_LLM_TIMEOUT_S", 60.0),
+            timeout_s=_float_env(values, "MLS_LLM_TIMEOUT_S", 120.0),
             max_tool_rounds=_int_env(values, "MLS_LLM_MAX_TOOL_ROUNDS", 4),
             disabled=_truthy(values.get("MLS_LLM_DISABLED")),
         )

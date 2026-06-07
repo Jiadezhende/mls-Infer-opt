@@ -23,5 +23,35 @@ loop 自己持有的职责（不外包给业务模块的「训练器」逻辑）
 不变量：未过 correctness 不发布；产物永不退化或缺失；generate/analyze 无直接发布权；
 agent 始终 exit 0。
 
-依赖：generate / evaluate / analyze / state。具体状态机与函数签名 TBD。
+依赖：generate / evaluate / analyze / state。
 """
+
+from __future__ import annotations
+
+from .trainer import (
+    AnalyzeFn,
+    BootstrapFn,
+    EvaluateFn,
+    LoopConfig,
+    LoopHooks,
+    ProposeFn,
+    RepairFn,
+    build_task_context,
+    finalize,
+    keep_best,
+    run_loop,
+)
+
+__all__ = [
+    "AnalyzeFn",
+    "BootstrapFn",
+    "EvaluateFn",
+    "LoopConfig",
+    "LoopHooks",
+    "ProposeFn",
+    "RepairFn",
+    "build_task_context",
+    "finalize",
+    "keep_best",
+    "run_loop",
+]

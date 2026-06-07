@@ -37,7 +37,14 @@ from ..state.eval import GateResult, GateStage, ValidationError
 from .policy import Policy, default_policy, strategy_tags, to_json
 from .prompt import PromptMode, build_prompt
 
-__all__ = ["LLMClient", "bootstrap", "propose", "repair", "check_self_contained"]
+__all__ = [
+    "LLMClient",
+    "baseline_engine_source",
+    "bootstrap",
+    "propose",
+    "repair",
+    "check_self_contained",
+]
 
 _BASELINE_PATH = Path(__file__).parent / "assets" / "baseline_engine.py"
 
@@ -83,6 +90,15 @@ class LLMClient(Protocol):
 
 
 # === 公共入口 =========================================================
+def baseline_engine_source() -> str:
+    """pristine baseline 的源码字符串——原始兜底。
+
+    bootstrap 把它落成首个候选；进程外壳（loop.__main__）在一切都失败时也用它直接补出
+    ``workspace/engine.py``，保证「engine.py 必在盘上」这条对外契约即便 run_loop 自己崩溃也成立。
+    """
+    return _BASELINE_PATH.read_text(encoding="utf-8")
+
+
 def bootstrap(ctx: TaskContext) -> Candidate:
     """不依赖 LLM 的保守初始候选——直接落 pristine baseline。永久兜底，必产。"""
     code = _BASELINE_PATH.read_text(encoding="utf-8")

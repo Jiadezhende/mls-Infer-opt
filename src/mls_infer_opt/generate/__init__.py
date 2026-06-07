@@ -32,7 +32,14 @@
 
 from __future__ import annotations
 
-from .codegen import LLMClient, bootstrap, check_self_contained, propose, repair
+from .codegen import (
+    LLMClient,
+    baseline_engine_source,
+    bootstrap,
+    check_self_contained,
+    propose,
+    repair,
+)
 from .compat import CONSTRAINTS, Requires, Violation, resolve, validate
 from .policy import (
     AggregateResult,
@@ -78,6 +85,7 @@ __all__ = [
     "render_policy_instructions",
     # codegen
     "LLMClient",
+    "baseline_engine_source",
     "bootstrap",
     "propose",
     "repair",

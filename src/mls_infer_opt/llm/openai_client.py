@@ -167,6 +167,9 @@ class OpenAIAgentClient:
         kwargs: dict[str, Any] = {
             "api_key": self.config.api_key,
             "timeout": self.config.timeout_s,
+            # SDK 默认 max_retries=2 会在超时后静默再试（最坏 ≈ timeout×3），
+            # codegen 长输出下会放大成数分钟「假死」；收敛为不重试，重试交上层循环。
+            "max_retries": 0,
         }
         if self.config.base_url:
             kwargs["base_url"] = self.config.base_url
