@@ -12,6 +12,10 @@ export MLS_RUNS_DIR="$REPO_DIR/runs"
 export MLS_OUTPUT_DIR="/workspace"
 export PYTHONPATH="$REPO_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
 
+# 评测外墙约 30min；设 28min 内部硬墙，留 ~2min 给末轮收尾 + finalize 发布 best，
+# 避免跑过点被外部 kill（届时只剩兜底 baseline，等于白跑）。
+export MLS_TIME_BUDGET_S="${MLS_TIME_BUDGET_S:-1680}"
+
 cd "$REPO_DIR"
 
 # 优先用本仓库 venv 的解释器（editable 安装），否则退回 PATH 上的 python3。

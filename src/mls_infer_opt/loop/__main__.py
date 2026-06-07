@@ -20,7 +20,7 @@ import sys
 from pathlib import Path
 
 from ..generate import baseline_engine_source
-from ..state.context import Environment
+from ..state.context import Environment, Limits
 from .trainer import LoopConfig, LoopHooks, build_task_context, run_loop
 
 
@@ -73,6 +73,20 @@ def _ensure_fallback_engine(publish_path: str) -> None:
         pass
 
 
+def _time_budget_s() -> int:
+    """从 env 读时间硬墙（秒）；缺省/非法都退回 0 = 不限。
+
+    评测有外部墙（约 30min）时，run.sh 把它设成略小值（如 1680=28min），loop 会在 elapsed
+    到点后于下一轮开始前优雅停 + finalize 发布 best，避免被外部 kill 导致只剩兜底 baseline。
+    """
+
+    raw = os.environ.get("MLS_TIME_BUDGET_S", "0")
+    try:
+        return max(0, int(float(raw)))
+    except (TypeError, ValueError):
+        return 0
+
+
 def main() -> int:
     """装配并跑一次调优循环。无论发生什么都保证 engine.py 落盘并返回 0。"""
 
@@ -83,6 +97,7 @@ def main() -> int:
         output_dir=os.environ.get("MLS_OUTPUT_DIR", "workspace"),
         device=device,
         environment=environment,
+        limits=Limits(time_budget_s=_time_budget_s()),
     )
     try:
         run_loop(ctx, llm=_build_llm(), hooks=LoopHooks(), config=LoopConfig())

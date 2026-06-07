@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from mls_infer_opt.generate.policy import aggregate, default_policy, strategy_tags, to_json
-from mls_infer_opt.loop import LoopConfig, LoopHooks, run_loop
+from mls_infer_opt.loop import LoopConfig, LoopHooks, keep_best, run_loop
 from mls_infer_opt.state.candidate import (
     Candidate,
     candidate_engine_path,
@@ -239,3 +239,42 @@ def test_run_loop_repairs_failed_candidate_and_promotes_repair(tmp_path: Path):
     assert state.best_score == 2.0
     assert Path(ctx.engine_publish_path).read_text(encoding="utf-8") == "repaired engine"
     assert any(e.phase == "repair" for e in state.events)
+
+
+def test_keep_best_publishes_engine_immediately(tmp_path: Path):
+    """每刷新一次 best 就当场发布——不依赖末尾 finalize，保证被中途 kill 时盘上已是最新 best。"""
+
+    ctx = _ctx(tmp_path)
+    candidate = _evaluate_fake(
+        _persist_fake(ctx, default_policy(), "first best engine", score=1.0), ctx
+    )
+    state = LoopState(task_context=ctx)
+
+    # 关键：只调 keep_best，绝不调 finalize / run_loop。
+    promoted = keep_best(state, candidate)
+
+    assert promoted is True
+    assert Path(ctx.engine_publish_path).read_text(encoding="utf-8") == "first best engine"
+    promote_evt = next(e for e in state.events if e.message.startswith("提升 best"))
+    assert promote_evt.data.get("published") is True
+
+
+def test_keep_best_republishes_on_strict_improvement(tmp_path: Path):
+    """后续更优 best 覆盖发布点；未提升的候选不动发布点。"""
+
+    ctx = _ctx(tmp_path)
+    state = LoopState(task_context=ctx)
+
+    first = _evaluate_fake(_persist_fake(ctx, default_policy(), "engine v1", score=1.0), ctx)
+    keep_best(state, first)
+    worse = _evaluate_fake(
+        _persist_fake(ctx, aggregate({}, round=1).policy, "engine worse", score=0.5), ctx
+    )
+    assert keep_best(state, worse) is False
+    assert Path(ctx.engine_publish_path).read_text(encoding="utf-8") == "engine v1"
+
+    better = _evaluate_fake(
+        _persist_fake(ctx, aggregate({}, round=2).policy, "engine v2", score=2.0), ctx
+    )
+    assert keep_best(state, better) is True
+    assert Path(ctx.engine_publish_path).read_text(encoding="utf-8") == "engine v2"

@@ -235,13 +235,30 @@ def keep_best(state: LoopState, candidate: Candidate) -> bool:
     old_best = state.best_id
     state.set_best(candidate, score)
     state.stale_rounds = 0
+
+    # 增量发布：每刷新一次 best，立刻把这份已过 gate 的 engine.py 拷到发布点。
+    # 候选源码早已落在 runs/.../candidates/{id}/engine.py，发布只是一次 copyfile。
+    # 这样进程在任意时刻被外部 kill（评测墙），盘上始终是最新 best，不必等末尾 finalize；
+    # finalize 仍是权威终发（含 final gate 复核），此处只做随时可用的安全网。
+    ctx = state.task_context
+    published = _copy_engine(
+        candidate_engine_path(ctx.run_dir, candidate.id), ctx.engine_publish_path
+    )
     _emit(
         state,
         f"提升 best：{candidate.id}",
         "keep_best",
         candidate_id=candidate.id,
-        data={"old_best_id": old_best, "best_score": score},
+        data={"old_best_id": old_best, "best_score": score, "published": published},
     )
+    if not published:
+        _emit(
+            state,
+            f"增量发布失败（finalize 兜底）：{ctx.engine_publish_path}",
+            "keep_best",
+            level="warning",
+            candidate_id=candidate.id,
+        )
     return True
 
 
