@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from .. import present
 from .config import LLMConfig
 from .tooling import ToolExecutor, ToolRegistry, ToolResult, ToolSpec
 
@@ -109,6 +110,8 @@ class OpenAIAgentClient:
                 pending_calls = _extract_tool_calls(output_items)
                 text = _extract_text(response)
                 if not pending_calls:
+                    # 模型给出最终答复、无更多工具调用——这一轮 agent 收束。
+                    present.emit(f"  agent r{round_index}: 完成（{len(text or '')} 字）")
                     return AgentResult(
                         ok=True,
                         text=text,
@@ -116,6 +119,10 @@ class OpenAIAgentClient:
                         usage=_extract_usage(response),
                         raw=response,
                     )
+                # 让终端看到「这一轮模型想调哪些工具」——agent 分析过程的实时投影。
+                present.emit(
+                    f"  agent r{round_index}: 调用工具 {[c.name for c in pending_calls]}"
+                )
                 if round_index >= rounds:
                     return AgentResult(
                         ok=False,
@@ -129,6 +136,10 @@ class OpenAIAgentClient:
                 input_items.extend(_item_to_input(item) for item in output_items)
                 for call in pending_calls:
                     result = executor.execute(call.name, call.arguments)
+                    present.emit(
+                        f"    ↳ {call.name} "
+                        + ("ok" if result.ok else f"err:{(result.error or {}).get('kind', '?')}")
+                    )
                     parsed_arguments = _arguments_to_dict(call.arguments)
                     tool_records.append(
                         ToolCallRecord(

@@ -14,14 +14,13 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import shutil
-import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from .. import present
 from ..analyze import analyze as default_analyze
 from ..evaluate import evaluate as default_evaluate
 from ..generate import bootstrap as default_bootstrap
@@ -163,6 +162,7 @@ def run_loop(
     hooks = hooks or LoopHooks()
     config = config or LoopConfig()
     state = LoopState(task_context=ctx)
+    state.on_event(stream_event)  # 进程边缘装观察者：此后每条事件实时流到 stderr
     started = time.monotonic()
     _ensure_dirs(ctx)
     _emit(state, "loop 启动", "init", data={"run_id": ctx.run_id})
@@ -173,12 +173,15 @@ def run_loop(
         _emit(state, f"bootstrap 候选：{baseline.id}", "bootstrap", candidate_id=baseline.id)
         _evaluate_candidate(state, baseline, hooks.evaluate, config.eval_timeout_s)
         if keep_best(state, baseline):
+            # bootstrap 提升后 best_score 恰为 baseline，冻结作 speedup 锚点（后续会被更优覆盖）。
+            state.baseline_score = state.best_score
             _emit(
                 state,
                 f"bootstrap 成为 best：{baseline.id}",
                 "keep_best",
                 candidate_id=baseline.id,
             )
+            present.emit(present.fmt_banner(state))
         else:
             _stop(state, "bootstrap_failed", "bootstrap 未产生可发布候选", level="error")
     except Exception as e:
@@ -189,6 +192,7 @@ def run_loop(
         if _safety_stop(state, config):
             break
 
+        present.emit("  · 分析中…")  # 瞬态进度：仅 stderr，不落 results.log
         try:
             policy = hooks.analyze(state, llm=llm)
         except Exception as e:
@@ -230,7 +234,11 @@ def keep_best(state: LoopState, candidate: Candidate) -> bool:
             f"候选未提升：{candidate.id}",
             "keep_best",
             candidate_id=candidate.id,
-            data={"score": score, "best_score": state.best_score},
+            data={
+                "score": score,
+                "best_score": state.best_score,
+                "score_line": present.fmt_score_line(candidate.bench, state.baseline_score),
+            },
         )
         return False
 
@@ -251,7 +259,12 @@ def keep_best(state: LoopState, candidate: Candidate) -> bool:
         f"提升 best：{candidate.id}",
         "keep_best",
         candidate_id=candidate.id,
-        data={"old_best_id": old_best, "best_score": score, "published": published},
+        data={
+            "old_best_id": old_best,
+            "best_score": score,
+            "published": published,
+            "score_line": present.fmt_score_line(candidate.bench, state.baseline_score),
+        },
     )
     if not published:
         _emit(
@@ -286,6 +299,7 @@ def finalize(
             state.stop_reason = "no_publishable_candidate"
         _emit(state, "finalize 无 best 可发布", "finalize", level="error")
         _write_artifacts(state, enabled=config.publish_artifacts)
+        present.emit(present.fmt_acceptance(state))
         return state
 
     if best.gate is None:
@@ -340,6 +354,7 @@ def finalize(
         )
 
     _write_artifacts(state, enabled=config.publish_artifacts)
+    present.emit(present.fmt_acceptance(state))
     return state
 
 
@@ -356,6 +371,7 @@ def _run_policy_round(
         _stop(state, "missing_best_code", "best 源码缺失，无法继续生成", level="error")
         return False
 
+    present.emit("  · 生成候选中…")  # 瞬态进度：仅 stderr，不落 results.log
     try:
         candidate = hooks.propose(ctx, policy, parent_code, llm=llm)
     except Exception as e:
@@ -398,6 +414,7 @@ def _run_repairs(
             _emit(state, f"repair 跳过：候选源码缺失 {cur.id}", "repair", level="warning")
             return False
         errors = cur.gate.errors if cur.gate is not None else []
+        present.emit(f"  · 修复中（第 {attempt} 次）…")  # 瞬态进度：仅 stderr，不落 results.log
         try:
             repaired = hooks.repair(ctx, policy, parent_code, errors, llm=llm)
         except Exception as e:
@@ -449,6 +466,7 @@ def _evaluate_candidate(
     timeout_s: float | None,
 ) -> Candidate:
     already_evaluated = candidate.gate is not None
+    present.emit(f"  · 评测中 {candidate.id}…")  # 瞬态进度：仅 stderr，不落 results.log
     try:
         evaluated = evaluate_fn(candidate, state.task_context, "full", timeout_s=timeout_s)
         if not already_evaluated:
@@ -461,15 +479,30 @@ def _evaluate_candidate(
         return candidate
 
     passed = bool(candidate.gate and candidate.gate.passed)
+    data: dict[str, Any] = {
+        "passed": passed,
+        "score": candidate.bench.score if candidate.bench is not None else None,
+    }
+    if candidate.bench is not None:
+        # 把「带单位 + ×baseline」的分数行算好塞进 event.data——stream_event 只拿得到 event，
+        # 这是它显示 speedup 的唯一来源；results.log 的数据块也复用同一份 score_line。
+        data["score_line"] = present.fmt_score_line(candidate.bench, state.baseline_score)
+    elif not passed and candidate.gate is not None:
+        # 失败候选：把「卡在哪阶段 / 错因 / 多少 case 不过」塞进 event.data，让验收者看到为何不过，
+        # 而非只见「评测失败」。错因本就挂在 candidate.gate 上，这里只是搬进事件供渲染。
+        if candidate.gate.errors:
+            err = candidate.gate.errors[0]
+            data["gate_stage"] = err.stage
+            data["gate_error"] = err.message
+        cs = candidate.gate.case_summary or {}
+        if "total" in cs:
+            data["cases"] = f"{cs.get('passed', '?')}/{cs.get('total', '?')} 通过"
     _emit(
         state,
         f"评测{'通过' if passed else '失败'}：{candidate.id}",
         "evaluate",
         candidate_id=candidate.id,
-        data={
-            "passed": passed,
-            "score": candidate.bench.score if candidate.bench is not None else None,
-        },
+        data=data,
     )
     return candidate
 
@@ -543,6 +576,10 @@ def _copy_engine(src: str, dst: str) -> bool:
 
 def _summary(state: LoopState) -> dict[str, Any]:
     best = state.best_candidate()
+    gate = best.gate if best is not None else None
+    gate_fail_stage = ""
+    if gate is not None and not gate.passed and gate.errors:
+        gate_fail_stage = gate.errors[0].stage
     return {
         "run_id": state.task_context.run_id,
         "stop_reason": state.stop_reason,
@@ -559,6 +596,12 @@ def _summary(state: LoopState) -> dict[str, Any]:
         if best is not None
         else "",
         "run_final_dir": str(_final_dir(state.task_context)),
+        # —— 让验收者一眼读懂「比 baseline 快多少 / 正确性」的增量字段 ——
+        "baseline_score": state.baseline_score if math.isfinite(state.baseline_score) else None,
+        "speedup": present.speedup(state.best_score, state.baseline_score),
+        "score_breakdown": present.score_breakdown(best.bench) if best is not None else {},
+        "correctness_passed": bool(gate and gate.passed),
+        "gate_stage_on_fail": gate_fail_stage,
     }
 
 
@@ -596,12 +639,18 @@ def _json_safe(value: Any) -> Any:
 
 
 def _render_events(state: LoopState) -> str:
+    """results.log：每条事件一行表头（保持旧格式、可 grep），其下缩进渲染 event.data 明细。
+
+    旧版只打 message、把 data 整段丢掉——rationale / 策略 delta / 分数分量因此全不可见。这里靠
+    present.format_data_block 把那些「已采集但被丢」的信号补回来，让验收者看懂每轮为何这么决策。
+    """
     lines = []
     for event in state.events:
         cid = f" candidate={event.candidate_id}" if event.candidate_id else ""
         lines.append(
             f"[{event.ts}] {event.level} {event.source}.{event.phase}:{cid} {event.message}"
         )
+        lines.extend(present.format_data_block(event))
     return "\n".join(lines) + ("\n" if lines else "")
 
 
@@ -626,45 +675,42 @@ def _emit(
         data=payload,
     )
     state.add_event(event)
-    _stream_event(event)
 
 
-# 关键字段：实时行只点出这几个高频指标，其余仍完整落在 results.log / report3.json。
-_STREAM_KEYS = ("passed", "score", "best_score", "stop_reason", "attempt", "published")
+# 无 score_line 的事件，仍按这几个高频键点出指标；其余完整落 results.log / report3.json。
+_STREAM_KEYS = ("passed", "stop_reason", "attempt", "published")
 
 
-def _stream_enabled() -> bool:
-    """事件是否实时打到终端。默认开；``MLS_LOG_STREAM=0`` 关掉（如不想污染日志通道）。
+def stream_event(event: AgentEvent) -> None:
+    """事件观察者：把单条 AgentEvent 实时写 stderr，给评测终端逐轮反馈。
 
-    每次读 env、不缓存：测试可临时改 env 验证两种行为，run.sh 在进程启动前设一次即可。
+    由 ``run_loop`` 通过 ``state.on_event`` 装到 state 上，于是 loop / analyze 等**所有**来源的
+    事件一产生就出现在终端，而不必等 finalize 落 results.log。格式化失败被 present.emit 吞掉，
+    绝不影响主流程（事件本身早已入表）。
+
+    extra 的取舍：评测/keep_best 事件优先显示带单位 + ×baseline 的 ``score_line``（取代裸 score）；
+    analyze 事件追加 bottleneck + strategy，让诊断行自解释。于是 analyze→generate→evaluate→
+    keep_best 四行天然连成「诊断→策略→评测→结论」叙事。
     """
 
-    return os.environ.get("MLS_LOG_STREAM", "1").strip().lower() not in ("0", "false", "no", "")
+    data = event.data
+    rnd = data.get("round")
+    prefix = f"[r{rnd}]" if rnd is not None else "[--]"
+    cid = f" {event.candidate_id}" if event.candidate_id else ""
 
-
-def _stream_event(event: AgentEvent) -> None:
-    """把单条事件实时写 stderr，给评测终端逐轮反馈。best-effort，绝不抛、绝不拖垮 loop。
-
-    走 stderr 而非 stdout：与崩溃日志同通道，且不碰 worker↔parent 的 stdout 结果管道。
-    完整事件流仍由 finalize 落到 results.log，这里只是过程中的可观测性补充。
-    """
-
-    if not _stream_enabled():
-        return
-    try:
-        rnd = event.data.get("round")
-        prefix = f"[r{rnd}]" if rnd is not None else "[--]"
-        cid = f" {event.candidate_id}" if event.candidate_id else ""
-        bits = [
-            f"{k}={event.data[k]}"
-            for k in _STREAM_KEYS
-            if event.data.get(k) is not None
-        ]
+    extra = ""
+    if data.get("score_line"):
+        extra = f"  {data['score_line']}"
+    elif event.source == "analyze":
+        bits = []
+        if data.get("bottleneck"):
+            bits.append(f"bottleneck={data['bottleneck']}")
+        if data.get("next_strategy_tags"):
+            bits.append("strategy=" + ", ".join(str(t) for t in data["next_strategy_tags"]))
+        extra = f"  ({'; '.join(bits)})" if bits else ""
+    else:
+        bits = [f"{k}={data[k]}" for k in _STREAM_KEYS if data.get(k) is not None]
         extra = f"  ({', '.join(bits)})" if bits else ""
-        print(
-            f"{prefix} {event.level:<7} {event.phase}:{cid} {event.message}{extra}",
-            file=sys.stderr,
-            flush=True,
-        )
-    except Exception:  # noqa: BLE001 — 可观测性是尽力而为，写不出去也不能影响主流程
-        pass
+
+    where = f"{event.source}.{event.phase}"
+    present.emit(f"{prefix} {event.level:<7} {where}:{cid} {event.message}{extra}")
