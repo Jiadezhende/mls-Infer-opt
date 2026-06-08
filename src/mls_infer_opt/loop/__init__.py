@@ -13,7 +13,8 @@
         generate  按方向产新候选；过不了正确性则按报错修复（train）
         evaluate  正确性 gate + 吞吐 benchmark（eval）
         keep-best 与 best 比较，严格更优且已验证才替换（checkpoint 选优）
-    FINALIZE      对 best 做完整验证 → 发布 workspace/engine.py → 写 output3/report3
+    FINALIZE      对 best 做完整验证 → 发布 workspace/engine.py → 写 output3.json（含 rounds[]
+                  推理）+ runs/{run_id}/report.json（任务结果记录）；report3 是人手写开发报告、不产
 
 loop 自己持有的职责（不外包给业务模块的「训练器」逻辑）：
 - INIT/context、keep-best 选优、停止判定的执行、finalize 与 report 落盘。

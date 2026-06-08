@@ -152,15 +152,24 @@ def test_run_loop_bootstraps_and_publishes_when_analyze_stops(tmp_path: Path):
     assert state.best_score == 1.0
     assert Path(ctx.engine_publish_path).read_text(encoding="utf-8") == "baseline engine"
     final_dir = Path(ctx.run_dir) / "final"
+    workspace = Path(ctx.paths.output_dir)
     assert (final_dir / "engine.py").read_text(encoding="utf-8") == "baseline engine"
     assert (final_dir / "output3.json").exists()
-    assert (final_dir / "report3.json").exists()
     assert (final_dir / "results.log").exists()
-    output = json.loads((Path(ctx.paths.output_dir) / "output3.json").read_text(encoding="utf-8"))
+    # 运行结束的任务结果记录落本次 run 独立目录根；report3（开发报告）运行时不产。
+    assert (Path(ctx.run_dir) / "report.json").exists()
+    assert not (final_dir / "report3.json").exists()
+    assert not (workspace / "report3.json").exists()
+    # workspace 对外只交付 engine.py + output3.json；results.log 是日志、只留 runs/。
+    assert not (workspace / "results.log").exists()
+    output = json.loads((workspace / "output3.json").read_text(encoding="utf-8"))
     assert output["best_id"] == state.best_id
     assert output["stop_reason"] == "done"
     assert output["run_final_dir"] == str(final_dir)
     assert output["archived_engine_path"] == str(final_dir / "engine.py")
+    assert "rounds" in output and "result" in output
+    report = json.loads((Path(ctx.run_dir) / "report.json").read_text(encoding="utf-8"))
+    assert report["best_id"] == state.best_id and report["stop_reason"] == "done"
 
 
 def test_run_loop_promotes_strictly_better_candidate(tmp_path: Path):

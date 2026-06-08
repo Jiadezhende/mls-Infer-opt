@@ -27,7 +27,7 @@ class Paths:
 
     target_dir: str = ""   # 只读输入根：model_config.json + weights/，agent 绝不写
     runs_dir: str = ""      # runs/ 根；本次工作目录 = runs_dir/run_id
-    output_dir: str = ""    # 发布根：engine.py / output3.* / report3.*
+    output_dir: str = ""    # 对外发布根：只交付 engine.py + output3.*（report3 是人手写开发报告）
 
 
 @dataclass

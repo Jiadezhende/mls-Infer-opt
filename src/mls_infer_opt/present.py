@@ -23,6 +23,7 @@ __all__ = [
     "render_event",
     "append_event",
     "fmt_banner",
+    "result_verdict",
     "fmt_acceptance",
 ]
 
@@ -112,7 +113,7 @@ _BLOCK_KEYS: tuple[tuple[str, str], ...] = (
 )
 _SITUATION_KEYS = ("best_id", "best_score", "stale_rounds", "n_candidates", "n_rejected")
 _LABEL_W = 10
-_TRUNC = 500  # rationale / 错因截断宽度（全文仍在 report3 快照）
+_TRUNC = 500  # rationale / 错因截断宽度（全文见 results.log / output3.json rounds[]）
 
 
 def _fmt_value(key: str, value: Any) -> str:
@@ -226,6 +227,22 @@ def _correctness(gate: Any) -> str:
     return f"correctness: FAILED at {stage}" + (f" — {msg}" if msg else "")
 
 
+def result_verdict(state: Any) -> str:
+    """任务结果判定：best 未过门 → failed；过门且 speedup>1 → accepted；否则 published_baseline。
+
+    fmt_acceptance 的标题、output3.json 与 runs/report.json 的 ``result`` 字段共用同一口径。
+    never-throw：异常 → ``failed``（最保守）。
+    """
+    try:
+        best = state.best_candidate()
+        if best is None or best.gate is None or not getattr(best.gate, "passed", False):
+            return "failed"
+        sp = speedup(state.best_score, state.baseline_score)
+        return "accepted" if sp is not None and sp > 1.0 else "published_baseline"
+    except Exception:  # noqa: BLE001
+        return "failed"
+
+
 def fmt_acceptance(state: Any) -> str:
     """结尾验收块——验收者的头条。按结果切标题，失败时给原因。"""
     try:
@@ -233,9 +250,10 @@ def fmt_acceptance(state: Any) -> str:
         best = state.best_candidate()
         baseline = state.baseline_score
         sp = speedup(state.best_score, baseline) if best is not None else None
-        if best is None or best.gate is None or not best.gate.passed:
+        verdict = result_verdict(state)
+        if verdict == "failed":
             title = "Result: FAILED (best did not pass final gate)"
-        elif sp is not None and sp > 1.0:
+        elif verdict == "accepted":
             title = f"Result: ACCEPTED (beat baseline {sp:.2f}×)"
         else:
             title = "Result: PUBLISHED BASELINE (no improvement found)"

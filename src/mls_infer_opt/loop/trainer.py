@@ -27,7 +27,7 @@ from ..generate import bootstrap as default_bootstrap
 from ..generate import propose as default_propose
 from ..generate import repair as default_repair
 from ..state.candidate import Candidate, candidate_engine_path
-from ..state.common import to_dict, utcnow_iso
+from ..state.common import utcnow_iso
 from ..state.context import Environment, Limits, Paths, TaskContext
 from ..state.eval import EvalMode, ValidationError, geomean_score
 from ..state.loop import AgentEvent, EventLevel, LoopState
@@ -284,9 +284,9 @@ def finalize(
     hooks: LoopHooks | None = None,
     config: LoopConfig | None = None,
 ) -> LoopState:
-    """发布当前 best 到 ``ctx.engine_publish_path``，并写 output3/report3/results.log。
+    """发布当前 best 到 ``ctx.engine_publish_path``，并写 output3.json / report.json / results.log。
 
-    发布仍以 correctness gate 为硬门。没有 best 或 best 未过门时只写 artifact 说明，不发布 engine。
+    发布以 correctness gate 为硬门。没有 best 或 best 未过门时只写 artifact 说明，不发布 engine。
     """
 
     hooks = hooks or LoopHooks()
@@ -628,24 +628,65 @@ def _summary(state: LoopState) -> dict[str, Any]:
         else "",
         "run_final_dir": str(_final_dir(state.task_context)),
         # —— 让验收者一眼读懂「比 baseline 快多少 / 正确性」的增量字段 ——
+        "result": present.result_verdict(state),
         "baseline_score": state.baseline_score if math.isfinite(state.baseline_score) else None,
         "speedup": present.speedup(state.best_score, state.baseline_score),
         "score_breakdown": present.score_breakdown(best.bench) if best is not None else {},
         "correctness_passed": bool(gate and gate.passed),
         "gate_stage_on_fail": gate_fail_stage,
+        # —— 逐轮推理叙事（诊断→策略→评测→结论），让 output3.* 自带推理而非只摘要 ——
+        "rounds": _reasoning_trace(state),
     }
 
 
+def _reasoning_trace(state: LoopState) -> list[dict[str, Any]]:
+    """逐轮推理的紧凑机读数组，嵌进 output3.json / runs/report.json。
+
+    以每条 analyze 事件为一轮的锚：取诊断（bottleneck）/方向（strategy_tags/knobs_delta）/理由
+    （rationale=event.data["detail"]）/判定（continue|stop），再并入该 analyze 之后、下一条 analyze
+    之前最后一次 evaluate 的 {candidate_id, passed, score} 作结论。never-throw → []。
+    """
+    try:
+        trace: list[dict[str, Any]] = []
+        cur: dict[str, Any] | None = None
+        for ev in state.events:
+            data = ev.data or {}
+            if ev.source == "analyze":
+                cur = {
+                    "step": len(trace) + 1,
+                    "decision": data.get("decision"),
+                    "bottleneck": data.get("bottleneck") or "",
+                    "rationale": data.get("detail") or "",
+                    "strategy_tags": list(data.get("next_strategy_tags") or []),
+                    "knobs_delta": dict(data.get("knobs_delta") or {}),
+                    "used_llm": bool(data.get("used_llm", False)),
+                }
+                if data.get("stop_reason"):
+                    cur["stop_reason"] = data["stop_reason"]
+                trace.append(cur)
+            elif ev.source == "loop" and ev.phase == "evaluate" and cur is not None:
+                # 该轮 analyze 之后的评测结论：覆盖式取最后一次（含 repair 后的最终评测）。
+                cur["candidate_id"] = ev.candidate_id
+                cur["passed"] = bool(data.get("passed", False))
+                if data.get("score") is not None:
+                    cur["score"] = data["score"]
+        return trace
+    except Exception:  # noqa: BLE001 — 叙事采集绝不拖垮 finalize 落盘
+        return []
+
+
 def _install_observer(state: LoopState) -> None:
-    """装事件观察者：每条事件实时 (a) 流 stderr、(b) 增量 append 到发布根的 results.log。
+    """装事件观察者：每条事件实时 (a) 流 stderr、(b) 增量 append 到 runs/.../final/results.log。
 
     增量写让 results.log 在被 Ctrl-C / SIGTERM / 评测墙中途 kill 时也已落到最新一条，不必等
-    finalize（与 engine.py 增量发布同一抗 kill 哲学）。先清空同 output_dir 里上一个 run 的残留，
-    再逐条 append；写盘失败则降级为仅 stderr。
+    finalize（与 engine.py 增量发布同一抗 kill 哲学）。results.log 是逐轮事件日志、只留档本次 run
+    的独立目录（runs/{run_id}/final），不进对外 workspace（对外交付只有 engine.py + output3.json）。
+    先清空 final/ 里上一个 run 的残留，再逐条 append；写盘失败则降级为仅 stderr。
     """
-    log_path: Path | None = Path(state.task_context.paths.output_dir) / "results.log"
+    final_log = _final_dir(state.task_context) / "results.log"
+    log_path: Path | None = final_log
     try:
-        log_path.write_text("", encoding="utf-8")
+        final_log.write_text("", encoding="utf-8")  # 清空上一个 run 的残留
     except OSError:
         log_path = None
 
@@ -672,18 +713,26 @@ def _publish_summary(state: LoopState) -> None:
 
 
 def _write_artifacts(state: LoopState, *, enabled: bool) -> None:
+    """终发落盘：output3.json（含 result/rounds 推理）对外发布到 workspace + 留档 runs/final；
+    results.log 只留档 runs/final；运行结束的「任务结果记录」写 runs/{run_id}/report.json。
+
+    report3（摘要 + 完整 LoopState 快照）是开发报告、由人手写，运行时**不产**（不变量见模块约定）。
+    """
     if not enabled:
         return
-    output_dirs = (Path(state.task_context.paths.output_dir), _final_dir(state.task_context))
+    ctx = state.task_context
+    workspace = Path(ctx.paths.output_dir)
+    archive = _final_dir(ctx)
     try:
-        summary = _summary(state)
-        report = {"summary": summary, "state": to_dict(state)}
-        events = _render_events(state)
-        for out_dir in output_dirs:
+        summary_json = _json_dump(_summary(state))
+        # workspace 对外只交付 engine.py + output3.json；runs/final 同步留一份作审计复盘。
+        for out_dir in (workspace, archive):
             out_dir.mkdir(parents=True, exist_ok=True)
-            (out_dir / "output3.json").write_text(_json_dump(summary), encoding="utf-8")
-            (out_dir / "report3.json").write_text(_json_dump(report), encoding="utf-8")
-            (out_dir / "results.log").write_text(events, encoding="utf-8")
+            (out_dir / "output3.json").write_text(summary_json, encoding="utf-8")
+        # results.log 是逐轮事件日志：只留 runs/{run_id}/final，不进对外 workspace。
+        (archive / "results.log").write_text(_render_events(state), encoding="utf-8")
+        # 运行结束的任务结果记录，落本次 run 的独立目录根（runs/{run_id}）。
+        (Path(ctx.run_dir) / "report.json").write_text(summary_json, encoding="utf-8")
     except OSError as e:
         _emit(state, f"artifact 写入失败：{e}", "finalize", level="error")
 
@@ -734,7 +783,7 @@ def _emit(
     state.add_event(event)
 
 
-# 无 score_line 的事件，仍按这几个高频键点出指标；其余完整落 results.log / report3.json。
+# 无 score_line 的事件，仍按这几个高频键点出指标；其余完整落 results.log（runs/final 留档）。
 _STREAM_KEYS = ("passed", "stop_reason", "attempt", "published")
 
 

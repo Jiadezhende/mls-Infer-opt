@@ -9,7 +9,8 @@
 
 - **阶段 A（本仓库）**：`run.sh -> python -m mls_infer_opt.loop`（入口即 `loop/__main__.py`）。
   agent 可以读取公开的 `model_config` 和 weights，在本地跑调优循环，最后落盘
-  `workspace/engine.py`、`output3.*`、`report3.*`，并保证退出。
+  `workspace/engine.py`、`output3.*`（含逐轮 `rounds[]` 推理）+ `runs/{run_id}/report.json`
+  （任务结果记录），并保证退出。
 - **阶段 B（外部评测器）**：agent 已退出。评测器只 import `workspace/engine.py`，调用
   `create_engine / prefill / decode / remove`，先比 reference logits 的 correctness，再测
   prefill/decode/mixed 吞吐与显存。
@@ -81,25 +82,24 @@ flowchart TD
    结构化 `ValidationError` 回灌给 generate。
 8. 未提升则 `stale_rounds += 1`；提升则 `stale_rounds = 0`。
 9. finalize 发布当前 best 到 `ctx.engine_publish_path`，并写：
-   - `output3.json`：轻量摘要。
-   - `report3.json`：摘要 + `LoopState` 快照。
-   - `results.log`：事件流文本。
+   - `output3.json`：摘要 + `result` 结果判定 + `rounds[]` 逐轮推理（诊断→策略→评测→结论）。对外发布。
+   - `runs/{run_id}/report.json`：任务结果记录（内容同 output3.json）。`report3` 是人手写开发报告、运行时不产。
+   - `results.log`：逐轮事件流文本，只留档 `runs/{run_id}/final`。
 
-同一批最终产物会双写：
+产物落点：
 
 ```text
-workspace/engine.py
+workspace/engine.py            # 对外提交面：只交付 engine.py + output3.json
 workspace/output3.json
-workspace/report3.json
-workspace/results.log
 
-runs/{run_id}/final/engine.py
+runs/{run_id}/report.json          # 任务结果记录（运行结束产出，落 run 目录根）
+runs/{run_id}/final/engine.py      # 审计快照：留档最终发布物
 runs/{run_id}/final/output3.json
-runs/{run_id}/final/report3.json
-runs/{run_id}/final/results.log
+runs/{run_id}/final/results.log    # 逐轮事件日志（增量写、抗中途 kill）
 ```
 
-`workspace/` 是对外提交面；`runs/{run_id}/final/` 是本次 run 的审计快照，便于复盘最终发布物。
+`workspace/` 是对外提交面（engine.py + output3.*）；`runs/{run_id}/` 是本次 run 的独立目录——
+`report.json` 在根作任务结果记录，`final/` 留档审计快照与 results.log 日志。`report3` 是人手写开发报告、非运行时产物。
 
 ## 4. 数据如何流动
 
@@ -188,12 +188,14 @@ tool-loop，loop 的外层契约不需要变：它仍只接收 `Candidate | None
 - `analyze` 分层与测试。
 - `generate` 搜索空间、policy 聚合、候选落盘、bootstrap/propose/repair。
 - `evaluate` gate/bench 子进程隔离。
-- `loop.trainer` 第一版可执行状态机、keep-best、repair 调度、finalize 发布、workspace/run-final
-  artifact 双写。
+- `loop.trainer` 第一版可执行状态机、keep-best、repair 调度、finalize 发布、artifact 落盘
+  （workspace 对外交付 engine.py+output3.json；runs/{run_id} 留档审计快照、results.log、report.json）。
+- `generate` agent 工具自检自闭环：把 `check_engine` 工具交给模型边写边自检（run_agent tool-loop），
+  外层 full gate 仍是唯一权威。
 
 仍待接线：
 
 - `loop/__main__.py` 进程入口已实装：探测 environment/device、按 env 建 LLM client、调 `run_loop`，
   最外层 try/finally 保证 `exit 0` 且 `workspace/engine.py` 必在盘上（原始 baseline 兜底）。
   `limits`/更细的环境字段仍可继续补。
-- report 可以从当前 `report3.json` 轻量快照继续扩展成人类可读版本。
+- 逐轮推理已机读化进 `output3.json` 的 `rounds[]`；人类可读的开发报告 `report3.*` 由人手写，运行时不产。
