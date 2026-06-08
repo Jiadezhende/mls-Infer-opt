@@ -6,7 +6,8 @@
 
 full 工况刻意**不规则**（ragged）：decode/mixed 每请求长度/停止步各异、跨多个 seed，逐 seed 取
 **下半均值**聚合——隐藏评测会换 batch/长度/步数/顺序，等长 lockstep 流过拟合分组策略，ragged 流才
-逼出 varlen 批处理/KV-cache 的真实鲁棒性。逐 (case,seed) 明细落 ``raw``，跨 seed 离散度落 ``extra``。
+逼出 varlen 批处理/KV-cache 的真实鲁棒性。逐 (case,seed) 明细落 ``raw``，跨 seed 离散度落
+``extra``。
 
 score：worker 侧只算**临时自评**（三类 tps 的加权几何平均，参照 ref=1），仅供 loop 外直接
 ``evaluate()`` 用；loop 内的**权威 score 由父进程按 baseline per-category tps 归一化后覆盖**
@@ -300,7 +301,8 @@ def run_bench(spec: JobSpec) -> BenchResult:
                 return True
             return False
 
-        pf = _run("prefill", _prefill_events(4, 128, vocab, _gen(_FULL_SEEDS[0]), spec.device), 1, 2)
+        pf_events = _prefill_events(4, 128, vocab, _gen(_FULL_SEEDS[0]), spec.device)
+        pf = _run("prefill", pf_events, 1, 2)
 
         decode_list: list[float] = []
         mixed_decode_list: list[float] = []

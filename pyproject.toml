@@ -35,6 +35,10 @@ extend-exclude = [
     "src/mls_infer_opt/generate/assets",
     "src/mls_infer_opt/evaluate/assets",
     "tests/assets",
+    # 运行时产物（gitignored）：runs/ 的候选/留档 engine.py 与 workspace/ 发布物都是
+    # 生成的纯 PyTorch 代码，非本仓库维护的源码，不纳入 lint。
+    "src/mls_infer_opt/runs",
+    "src/mls_infer_opt/workspace",
 ]
 
 [tool.ruff.lint]

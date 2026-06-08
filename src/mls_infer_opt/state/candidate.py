@@ -76,7 +76,8 @@ class Candidate:
     notes: str = ""
     created_at: str = field(default_factory=utcnow_iso)
     # 评测结果随生命周期后填（对象图，非外键 / 非并行表）。
-    gate: GateResult | None = None    # 外层权威 full gate（agent 内部 quick 自检 ephemeral，不进此处）
+    # gate：外层权威 full gate（agent 内部 quick 自检 ephemeral，不进此处）。
+    gate: GateResult | None = None
     bench: BenchResult | None = None  # 仅当 gate.passed 后才填（用 attach_bench 守护）
     extra: dict[str, Any] = field(default_factory=dict)
 
