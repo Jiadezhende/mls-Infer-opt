@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 __all__ = ["utcnow_iso", "to_dict"]
@@ -11,7 +11,7 @@ __all__ = ["utcnow_iso", "to_dict"]
 
 def utcnow_iso() -> str:
     """统一时间戳（UTC ISO8601）。state 里所有 ts 用它。"""
-    return datetime.now(UTC).isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 def to_dict(obj: Any) -> Any:
