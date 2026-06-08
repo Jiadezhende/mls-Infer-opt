@@ -16,8 +16,8 @@ from mls_infer_opt.analyze import (
     heuristic_decision,
     parse_decision,
 )
-from mls_infer_opt.generate.policy import aggregate, default_policy, to_json
 from mls_infer_opt.llm import FakeAgentClient
+from mls_infer_opt.searchspace.policy import aggregate, default_policy, to_json
 from mls_infer_opt.state.candidate import Candidate, candidate_policy_path
 from mls_infer_opt.state.context import Limits, Paths, TaskContext
 from mls_infer_opt.state.eval import BenchResult, GateResult, ValidationError

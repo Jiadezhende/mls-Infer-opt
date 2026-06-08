@@ -1,10 +1,10 @@
 """policy — Policy 数据结构：搜索空间里的一个点（共享契约，analyze 产 / generate 消费）。
 
-Policy 是 analyze（产出下一个点）与 generate（渲成 engine.py）之间交换的稳定结构，因此类型
-落在 state 层——让 analyze 不必 import generate 即可产 Policy。
+Policy 是 analyze（产出下一个点）与 generate（渲成 engine.py）之间交换的稳定结构，类型落在
+state 层（最底层契约），analyze 与 generate 都能直接引用、互不横向 import。
 
 这里**只放纯 dataclass**：键齐全、恒合法的 axes/knobs + 血缘/审计字段。聚合/消解/序列化等
-依赖搜索空间（generate.space / compat）的逻辑仍在 generate.policy（aggregate/merge/to_json…）。
+依赖搜索空间的逻辑在 searchspace 领域层（space / compat / policy：aggregate/merge/to_json…）。
 """
 
 from __future__ import annotations

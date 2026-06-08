@@ -12,8 +12,8 @@ from __future__ import annotations
 import json
 import re
 
-from ..generate.policy import grouped_axes
-from ..generate.space import AXES, GROUP_ORDER
+from ..searchspace.policy import grouped_axes
+from ..searchspace.space import AXES, GROUP_ORDER
 from ..state.eval import BenchResult, ValidationError
 from ..state.policy import Policy
 from .heuristic import Action, Decision

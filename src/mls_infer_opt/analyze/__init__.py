@@ -7,7 +7,7 @@
 - 定位瓶颈：从分项吞吐/显存/失败原因判断当前最该解决什么（prefill 慢？decode 慢？显存爆？
   正确性边界？）。
 - 给方向：从 best.policy 出发做局部搜索——选要动的轴/knob 作 delta，用
-  ``generate.policy.merge(best.policy, axes_delta=, knobs_delta=, rationale=)`` 构造**下一个
+  ``searchspace.policy.merge(best.policy, axes_delta=, knobs_delta=, rationale=)`` 构造**下一个
   合法 Policy** 返回（knob 只属 Policy.knobs，绝不碰 model_config 的结构字段）。``rationale``
   装瓶颈/方向/注意点的自然语言，generate 直接渲进 prompt。
 - 判停：预算耗尽 / 连续多轮无提升 / 失败率过高 / 达标 / 收益不足 / 轮数或时间上限
@@ -17,7 +17,7 @@
 GQA、合理 dtype、显存复用、SDPA、（视设备）torch.compile。
 
 LLM 可选：不可用时退化为基于规则的方向选择，不抛异常。
-产出：下一个 Policy（带 rationale）或 None（停机）。依赖：llm、generate.policy、state。
+产出：下一个 Policy（带 rationale）或 None（停机）。依赖：llm、searchspace、state（不碰 generate）。
 
 内部分层（对齐 generate 的粒度）：
 - situation  汇总 LoopState → 当前态势视图（ephemeral，不进 state）

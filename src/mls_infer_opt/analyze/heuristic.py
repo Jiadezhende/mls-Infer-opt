@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from ..generate.space import AXIS_BY_KEY
+from ..searchspace.space import AXIS_BY_KEY
 from ..state.policy import Policy
 from .situation import Situation
 

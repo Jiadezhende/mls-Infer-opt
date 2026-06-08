@@ -7,17 +7,15 @@ import importlib.util
 import pytest
 
 from mls_infer_opt.generate import (
-    aggregate,
     bootstrap,
     build_prompt,
     check_self_contained,
-    default_policy,
-    merge,
     propose,
     repair,
 )
 from mls_infer_opt.generate.codegen import _BASELINE_PATH
 from mls_infer_opt.llm import FakeAgentClient
+from mls_infer_opt.searchspace import aggregate, default_policy, merge
 from mls_infer_opt.state.candidate import candidate_engine_path
 from mls_infer_opt.state.context import Paths, TaskContext
 from mls_infer_opt.state.eval import ValidationError
@@ -291,11 +289,11 @@ def test_propose_accepts_agent_client_interface(tmp_path):
 
 # === 5. Policy 下沉 state =============================================
 def test_policy_dataclass_lives_in_state():
-    from mls_infer_opt.generate import Policy as GenPolicy
+    from mls_infer_opt.searchspace import Policy as SearchspacePolicy
     from mls_infer_opt.state import Policy as StatePolicy
 
-    # generate 仅 re-export，类型真身在 state（analyze 不必 import generate 即可产 Policy）。
-    assert GenPolicy is StatePolicy
+    # searchspace 仅 re-export，类型真身在 state（analyze 不必 import generate 即可产 Policy）。
+    assert SearchspacePolicy is StatePolicy
     assert StatePolicy.__module__ == "mls_infer_opt.state.policy"
 
 

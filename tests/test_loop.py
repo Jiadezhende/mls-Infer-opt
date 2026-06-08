@@ -7,8 +7,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from mls_infer_opt.generate.policy import aggregate, default_policy, strategy_tags, to_json
 from mls_infer_opt.loop import LoopConfig, LoopHooks, keep_best, run_loop
+from mls_infer_opt.searchspace.policy import aggregate, default_policy, strategy_tags, to_json
 from mls_infer_opt.state.candidate import (
     Candidate,
     candidate_engine_path,

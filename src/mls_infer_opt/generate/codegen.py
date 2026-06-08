@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Protocol
 
 from ..evaluate import quick_gate
+from ..searchspace.policy import Policy, default_policy, strategy_tags, to_json
 from ..state.candidate import (
     Candidate,
     candidate_engine_path,
@@ -34,7 +35,6 @@ from ..state.candidate import (
 )
 from ..state.context import TaskContext
 from ..state.eval import GateResult, GateStage, ValidationError
-from .policy import Policy, default_policy, strategy_tags, to_json
 from .prompt import PromptMode, build_prompt
 
 __all__ = [

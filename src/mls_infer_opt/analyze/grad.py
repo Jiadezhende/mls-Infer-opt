@@ -8,7 +8,7 @@
 - **无发布权 / 不判定 stop_reason**：analyze 只产 Policy 或 None，并 **每轮** emit 一条
   ``source="analyze"`` 事件（见 [[analyze-record-via-events]]）；停因放进事件
   ``data["stop_reason"]``，由 loop 读后落到 ``LoopState.stop_reason`` 收尾——analyze **绝不**自写。
-- 下一个 Policy 由 ``generate.policy.merge(best_policy, axes_delta=…, …, rationale=…)`` 构造，
+- 下一个 Policy 由 ``searchspace.policy.merge(best_policy, axes_delta=…, …, rationale=…)`` 构造，
   knob 只进 Policy.knobs，绝不碰 model_config（merge/aggregate 焊死）。
 """
 
@@ -17,7 +17,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Protocol
 
-from ..generate.policy import aggregate, default_policy, from_json, merge
+from ..searchspace.policy import aggregate, default_policy, from_json, merge
 from ..state.candidate import candidate_policy_path
 from ..state.loop import AgentEvent, EventLevel, LoopState
 from ..state.policy import Policy
@@ -162,7 +162,7 @@ def _load_best_policy(state: LoopState) -> Policy:
 
 def _nondefault_tags(policy: Policy) -> list[str]:
     """下一个 Policy 的非默认轴摘要（记进事件，便于 report 还原「这轮为何这么走」）。"""
-    from ..generate.policy import strategy_tags
+    from ..searchspace.policy import strategy_tags
 
     return strategy_tags(policy)
 

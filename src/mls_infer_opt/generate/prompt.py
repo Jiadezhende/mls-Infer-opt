@@ -15,10 +15,10 @@ from __future__ import annotations
 import json
 from typing import Literal
 
+from ..searchspace.policy import Policy, grouped_axes
+from ..searchspace.space import AXIS_BY_KEY, GROUP_ORDER
 from ..state.context import TaskContext
 from ..state.eval import ValidationError
-from .policy import Policy, grouped_axes
-from .space import AXIS_BY_KEY, GROUP_ORDER
 
 __all__ = ["ENGINE_CONTRACT", "build_prompt", "render_policy_instructions"]
 

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from ..generate.space import AXIS_BY_KEY
+from ..searchspace.space import AXIS_BY_KEY
 from ..state.candidate import Candidate
 from ..state.eval import BenchResult, ValidationError
 from ..state.loop import LoopState, candidate_status
@@ -129,7 +129,7 @@ def _best_axes(state: LoopState, best: Candidate | None) -> dict[str, str]:
     只需「哪些轴取了什么」给 ladder 跳过用，从 strategy_tags 还原即可（默认轴留给 baseline_axes
     在 grad 里补全），无需读盘。
     """
-    from ..generate.space import baseline_axes
+    from ..searchspace.space import baseline_axes
 
     axes = baseline_axes()
     if best is None:
