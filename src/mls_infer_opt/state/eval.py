@@ -20,25 +20,26 @@ __all__ = [
     "geomean_score",
 ]
 
-# score 各类意图权重（和=1）：decode 主导、mixed 次之、prefill 最末。几何平均的指数预算。
 # 放本模块（零 torch）以便 worker(bench) 与父进程(trainer) 共用同一份公式，不把 torch 拖进父进程。
-_W_DECODE, _W_MIXED, _W_PREFILL = 0.60, 0.25, 0.15
 _SCORE_EPS = 1e-9
 
 
-def geomean_score(r_decode: float, r_mixed: float, r_prefill: float) -> float:
-    """三类比值的加权几何平均（>0，越大越好）。scale-free：各类按意图权重贡献，不被量级绑架。
+def geomean_score(*ratios: float) -> float:
+    """传入比值的**等权**几何平均（>0，越大越好）。scale-free：不被某类量级绑架。
 
-    ``exp(0.60*ln r_d + 0.25*ln r_m + 0.15*ln r_p)``。父进程传"对 baseline 的 ratio"（baseline
-    自身→各 1.0→score 1.0）；worker 临时自评传原始 tps（参照 ref=1）。惩罚偏科：任一类塌到 0
-    （EPS 下限）即把整体拉到近 0，符合"该类失败=灾难"。每个入参单调。
+    口径对齐真实 grader：它逐 case 报「整体 tokens/s」与「decode tokens/s」两列、外加显存，**不公布
+    任何合成权重**。故这里不再内置 decode/mixed/prefill 权重，改由调用方把每个被计量的比值（各 case
+    的 overall-tps ratio + decode-tps ratio，见 trainer._normalize_score）平铺进来，等权合成——
+    overall:decode 的相对话语权由「平铺了几项」自然决定，而非我们拍的常数。
+
+    父进程传"对 baseline 的 ratio"（baseline 自身→各 1.0→score 1.0）；worker 临时自评传原始 tps
+    （参照 ref=1）。惩罚偏科：任一项塌到 0（EPS 下限）即把整体拉到近 0，符合"该项失败=灾难"。
+    每个入参单调。无入参 → 0.0。
     """
-    lg = (
-        _W_DECODE * math.log(max(r_decode, _SCORE_EPS))
-        + _W_MIXED * math.log(max(r_mixed, _SCORE_EPS))
-        + _W_PREFILL * math.log(max(r_prefill, _SCORE_EPS))
-    )
-    return math.exp(lg)
+    vals = [math.log(max(r, _SCORE_EPS)) for r in ratios]
+    if not vals:
+        return 0.0
+    return math.exp(sum(vals) / len(vals))
 
 GateStage = Literal["syntax", "api", "correctness", "runtime"]
 # quick：agent 自带工具在内层迭代自检用（小批 / 少 case，便宜、快；ephemeral，不进 state）。
@@ -93,7 +94,11 @@ class BenchResult:
     - throughput      tokens/s = (prefill + decode tokens) / elapsed
     - decode tokens/s          = decode tokens / elapsed
     - 三类 benchmark：prefill（长 prompt 批量预填）/ decode（多请求连续解码）/ mixed（含 remove）
-    字段对应：prefill_tps / decode_tps / mixed_tps / mixed_decode_tps + peak_memory_mb。
+    每类都按 grader 的两列计量：整体 tokens/s 与 decode tokens/s。字段对应——
+      · prefill：prefill_tps（整体；该 case 无 decode）
+      · decode ：decode_overall_tps（整体）/ decode_tps（decode 列）
+      · mixed  ：mixed_tps（整体）/ mixed_decode_tps（decode 列）
+    外加 peak_memory_mb（grader 每 case 都报；当前只计量+展示，不入 score，作护栏）。
 
     泛化：隐藏评测会变 batch / prompt 长度 / decode 步数 / 请求顺序，故 bench 在多组配置上跑，
     headline 字段取这些配置上的代表 / 聚合值，逐配置明细放 raw（不另起嵌套结构）。
@@ -103,6 +108,7 @@ class BenchResult:
     mode: EvalMode = "quick"
     prefill_tps: float = 0.0
     decode_tps: float = 0.0
+    decode_overall_tps: float = 0.0
     mixed_tps: float = 0.0
     mixed_decode_tps: float = 0.0
     peak_memory_mb: float = 0.0

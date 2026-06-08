@@ -118,6 +118,7 @@ def bench_from_dict(d: dict[str, Any]) -> BenchResult:
         mode=d.get("mode", "quick"),
         prefill_tps=float(d.get("prefill_tps", 0.0)),
         decode_tps=float(d.get("decode_tps", 0.0)),
+        decode_overall_tps=float(d.get("decode_overall_tps", 0.0)),
         mixed_tps=float(d.get("mixed_tps", 0.0)),
         mixed_decode_tps=float(d.get("mixed_decode_tps", 0.0)),
         peak_memory_mb=float(d.get("peak_memory_mb", 0.0)),

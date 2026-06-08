@@ -45,6 +45,15 @@ ANALYZE_CONTRACT = f"""\
 你是一个推理引擎自动调优器的 **grad（梯度）**：看本轮评测反馈与历史，定位瓶颈，从当前最优
 （best）出发做**局部搜索**，给出下一步该动哪条/哪几条轴，或判断应当停止。
 
+## 评分口径（grader 实际怎么打分）
+grader 逐 case 报两列：**整体 tokens/s**=(prefill+decode)/elapsed 与 **decode tokens/s**=
+decode/elapsed，外加峰值显存；**不公布合成权重**。含一个纯 prefill case（decode 列=0）。要点：
+- prefill 不是边角料：它独占一个 case，且每个 case 的「整体 tokens/s」分母都含 prefill 时间 →
+  prefill 提速会同时抬高所有 case 的整体列。
+- decode 仍是大头：多个 case 的 decode 列单独计量；baseline 每步重算整段，decode 提速空间最大。
+- 显存目前只观测、不直接扣分，但别盲目拿显存换速度。
+故方向上**整体吞吐与 decode 吞吐都要顾**，不要只盯单一指标。
+
 ## 优化主线先验（搜索空间的方向）
 baseline 每步 decode 重算整段（O(n²)）→ 增量 KV 缓存收益最大 → batched prefill / GQA / 合理
 dtype / 显存复用 / SDPA /（视设备）torch.compile。前置依赖：合批解码需 KV 缓存、enable_gqa 需
@@ -70,9 +79,12 @@ SDPA、qkv/mlp 融合需 weight_layout=fused。数值敏感(🔴)轴可能顶破
 def _fmt_bench(b: BenchResult | None) -> str:
     if b is None:
         return "（best 尚无 bench 数据）"
+    # 对齐 grader 的两列口径：每类 case 同时给「整体 tokens/s」与「decode tokens/s」。
     line = (
-        f"score={b.score:.4f} loss={b.loss:.4f} | prefill_tps={b.prefill_tps:.1f} "
-        f"decode_tps={b.decode_tps:.1f} mixed_tps={b.mixed_tps:.1f} "
+        f"score={b.score:.4f} loss={b.loss:.4f} | "
+        f"prefill={b.prefill_tps:.0f} | "
+        f"decode={b.decode_tps:.0f}(整体{b.decode_overall_tps:.0f}) | "
+        f"mixed_decode={b.mixed_decode_tps:.0f}(整体{b.mixed_tps:.0f}) | "
         f"peak_mem={b.peak_memory_mb:.0f}MB"
     )
     # 跨 seed 的 decode tps 离散度 = 抗不规则鲁棒性信号：min/max 拉得越开，说明对请求顺序越敏感，

@@ -78,13 +78,16 @@ def _evaluate_fake(
     )
     if passed:
         score = float(candidate.extra.get("fake_score", 0.0))
-        # 真实 full bench 三类 tps 都有值；这里都置为 score，使父进程归一化（对 baseline 各类
-        # ratio）得 score/baseline_score，baseline(score=1.0) 下恰还原为 score，保持断言语义。
+        # 真实 full bench 五个计量列都有值；这里全置为 score，使父进程归一化（对 baseline 各列
+        # ratio）后 geomean 仍是 score/baseline_score，baseline(score=1.0) 下恰还原为 score，
+        # 保持断言语义（_normalize_score 等权平铺 prefill/decode/mixed 的整体与 decode 两列）。
         candidate.attach_bench(
             BenchResult(
                 mode=mode,
                 score=score,
                 decode_tps=score,
+                decode_overall_tps=score,
+                mixed_tps=score,
                 mixed_decode_tps=score,
                 prefill_tps=score,
             )

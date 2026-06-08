@@ -464,11 +464,19 @@ def _register_candidate(state: LoopState, candidate: Candidate) -> Candidate:
 
 
 def _normalize_score(state: LoopState, candidate: Candidate) -> None:
-    """把候选 bench.score 归一化为"对 baseline per-category tps 的加权几何平均加速比"。
+    """把候选 bench.score 归一化为"对 baseline 各计量列 tps 的等权几何平均加速比"。
 
-    参照系 = bootstrap baseline 的 per-category tps（自校准到真实评测硬件）。baseline 自身 ref 即
-    自身 → 各 ratio 1.0 → score 1.0；后续候选 score≈×baseline，让 keep-best 严格比较与 speedup
-    展示都有诚实语义。无 baseline（bootstrap 评测当下尚未冻结）或缺 bench 时安全跳过，保留 worker
+    口径对齐真实 grader：它逐 case 报「整体 tokens/s」与「decode tokens/s」两列、不公布合成权重。
+    这里就把 grader 会量的每一列对 baseline 求比值、平铺进等权几何平均：
+      · prefill case：整体 tps（无 decode 列）
+      · decode  case：整体 tps + decode 列
+      · mixed   case：整体 tps + decode 列
+    overall:decode 的相对话语权由「平铺了几项」自然给出（overall 3 项 / decode 2 项），不再拍
+    0.60/0.25/0.15 这种我们自己的权重。peak_memory 不入分（grader 虽报，合成口径未知，先作护栏）。
+
+    参照系 = bootstrap baseline 的 per-列 tps（自校准到真实评测硬件）。baseline 自身 ref 即自身
+    → 各 ratio 1.0 → score 1.0；后续候选 score≈×baseline，让 keep-best 严格比较与 speedup 展示
+    都有诚实语义。无 baseline（bootstrap 评测当下尚未冻结）或缺 bench 时安全跳过，保留 worker
     临时自评。归一化在所有 score 消费者（keep_best / fmt_score_line / analyze）之前的唯一咽喉点。
     """
     bench = candidate.bench
@@ -480,15 +488,20 @@ def _normalize_score(state: LoopState, candidate: Candidate) -> None:
         return
 
     def _ratio(cand_tps: float, ref_tps: float) -> float:
-        # baseline 该类无数据（case 失败/0）→ ratio 中性 1.0，不让它把整体几何平均拖塌。
+        # baseline 该列无数据（case 失败/0，如纯 prefill 的 decode 列）→ ratio 中性 1.0，
+        # 不让它把整体几何平均拖塌；候选在有 baseline 信号的列丢分则照实惩罚。
         if ref_tps <= 1e-9:
             return 1.0
         return cand_tps / ref_tps
 
-    r_d = _ratio(bench.decode_tps, ref_bench.decode_tps)
-    r_m = _ratio(bench.mixed_decode_tps, ref_bench.mixed_decode_tps)
-    r_p = _ratio(bench.prefill_tps, ref_bench.prefill_tps)
-    bench.score = geomean_score(r_d, r_m, r_p)
+    ratios = (
+        _ratio(bench.prefill_tps, ref_bench.prefill_tps),            # prefill 整体
+        _ratio(bench.decode_overall_tps, ref_bench.decode_overall_tps),  # decode 整体
+        _ratio(bench.decode_tps, ref_bench.decode_tps),             # decode 列
+        _ratio(bench.mixed_tps, ref_bench.mixed_tps),               # mixed 整体
+        _ratio(bench.mixed_decode_tps, ref_bench.mixed_decode_tps),  # mixed decode 列
+    )
+    bench.score = geomean_score(*ratios)
     bench.loss = -bench.score
 
 

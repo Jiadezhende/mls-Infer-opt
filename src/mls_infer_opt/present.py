@@ -61,13 +61,17 @@ def _num(x: Any) -> str:
 
 
 def score_breakdown(bench: Any) -> dict[str, float]:
-    """BenchResult 的 headline 分量（tok/s + 合成 score）；bench=None → {}。"""
+    """BenchResult 的 headline 分量（grader 两列 tok/s + 显存护栏 + score）；bench=None → {}。"""
     if bench is None:
         return {}
     return {
         "decode_tps": _finite(getattr(bench, "decode_tps", None)) or 0.0,
         "prefill_tps": _finite(getattr(bench, "prefill_tps", None)) or 0.0,
         "mixed_decode_tps": _finite(getattr(bench, "mixed_decode_tps", None)) or 0.0,
+        # —— grader 同样逐 case 报「整体 tokens/s」：留进 breakdown 供 rounds[] 复盘 ——
+        "decode_overall_tps": _finite(getattr(bench, "decode_overall_tps", None)) or 0.0,
+        "mixed_tps": _finite(getattr(bench, "mixed_tps", None)) or 0.0,
+        "peak_memory_mb": _finite(getattr(bench, "peak_memory_mb", None)) or 0.0,
         "score": _finite(getattr(bench, "score", None)) or 0.0,
     }
 
@@ -79,17 +83,23 @@ def speedup(score: Any, baseline: Any) -> float | None:
 
 
 def fmt_score_line(bench: Any, baseline_score: Any, *, anchor: bool = True) -> str:
-    """``decode 312 / prefill 1840 / mixed 280 tok/s → score 301 (1.43× baseline)``。
+    """``decode 312 / prefill 1840 / mixed 280 tok/s · 587MB → score 1.43 (1.43× baseline)``。
 
-    bench=None → ``(无 bench)``。anchor=False 时只给分量+score、不附倍率（验收块自带 vs baseline）。
+    显示 decode 列三类 tps（最具诊断性）+ 峰值显存护栏（>0 才附，CPU 下省略）；score 保两位小数，
+    便于读出归一化后 ~1–3 倍的轮间增量（裸 .0f 会把 2.04 截成 2）。整体 tps 等完整分项见
+    output3.json 的 rounds[].score_breakdown。bench=None → ``(无 bench)``；anchor=False 时不附倍率。
     """
     if bench is None:
         return "(无 bench)"
     bd = score_breakdown(bench)
     base = (
         f"decode {bd['decode_tps']:.0f} / prefill {bd['prefill_tps']:.0f} / "
-        f"mixed {bd['mixed_decode_tps']:.0f} tok/s → score {bd['score']:.0f}"
+        f"mixed {bd['mixed_decode_tps']:.0f} tok/s"
     )
+    mem = bd.get("peak_memory_mb", 0.0)
+    if mem > 0:
+        base += f" · {mem:.0f}MB"
+    base += f" → score {bd['score']:.2f}"
     if not anchor:
         return base
     sp = speedup(bd["score"], baseline_score)

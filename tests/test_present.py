@@ -15,8 +15,14 @@ def _bench(**kw) -> BenchResult:
 
 def test_score_line_with_baseline():
     line = present.fmt_score_line(_bench(), 210.0)
-    assert "decode 312 / prefill 1840 / mixed 280 tok/s → score 301" in line
+    assert "decode 312 / prefill 1840 / mixed 280 tok/s → score 301.00" in line
     assert "(1.43× baseline)" in line
+
+
+def test_score_line_shows_peak_memory_when_set():
+    # 显存 >0（GPU）才附 · NNNMB 护栏段；CPU(mem=0) 不污染行
+    assert " · 587MB → score" in present.fmt_score_line(_bench(peak_memory_mb=587.0), 210.0)
+    assert "MB" not in present.fmt_score_line(_bench(), 210.0)
 
 
 def test_score_line_missing_baseline_marks_baseline():

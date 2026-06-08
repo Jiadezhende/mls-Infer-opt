@@ -9,9 +9,14 @@ full 工况刻意**不规则**（ragged）：decode/mixed 每请求长度/停止
 逼出 varlen 批处理/KV-cache 的真实鲁棒性。逐 (case,seed) 明细落 ``raw``，跨 seed 离散度落
 ``extra``。
 
-score：worker 侧只算**临时自评**（三类 tps 的加权几何平均，参照 ref=1），仅供 loop 外直接
-``evaluate()`` 用；loop 内的**权威 score 由父进程按 baseline per-category tps 归一化后覆盖**
-（见 loop/trainer._evaluate_candidate）。几何平均 scale-free、惩罚偏科；loss = -score。
+口径对齐真实 grader：它逐 case 报「整体 tokens/s」+「decode tokens/s」两列 + 峰值显存，故每类
+case 同时留**整体 tps**（prefill_tps / decode_overall_tps / mixed_tps）与 **decode tps**
+（decode_tps / mixed_decode_tps）；显存 peak_memory_mb 只计量不入分（护栏）。
+
+score：worker 侧只算**临时自评**（等权几何平均，参照 ref=1），仅供 loop 外直接 ``evaluate()``
+用；loop 内的**权威 score 由父进程按 baseline per-列 tps 归一化后覆盖**（见
+loop/trainer._normalize_score，把各 case 的 overall/decode 两列比值平铺进等权几何平均）。
+几何平均 scale-free、惩罚偏科；loss = -score。
 """
 
 from __future__ import annotations
@@ -241,12 +246,21 @@ def _measure_case(
     return runs[len(runs) // 2]
 
 
-def _score(prefill_tps: float, decode_tps: float, mixed_decode_tps: float) -> float:
-    """worker 侧临时自评（仅供 loop 外直接 evaluate）：三类原始 tps 的加权几何平均，参照 ref=1。
+def _score(
+    prefill_tps: float,
+    decode_tps: float,
+    mixed_decode_tps: float,
+    decode_overall_tps: float = 0.0,
+    mixed_tps: float = 0.0,
+) -> float:
+    """worker 侧临时自评（仅供 loop 外直接 evaluate）：各计量列原始 tps 的等权几何平均，参照 ref=1。
 
-    loop 内的权威 score 由父进程按 baseline per-category tps 归一化后覆盖（见 trainer）。
+    与权威口径同形：把各 case 的整体/decode 两列平铺等权（0 值被 EPS 下限吞，自评粗排够用）。
+    loop 内的权威 score 由父进程按 baseline per-列 tps 归一化后覆盖（见 trainer._normalize_score）。
     """
-    return geomean_score(decode_tps, mixed_decode_tps, prefill_tps)
+    return geomean_score(
+        prefill_tps, decode_overall_tps, decode_tps, mixed_tps, mixed_decode_tps
+    )
 
 
 def run_bench(spec: JobSpec) -> BenchResult:
@@ -280,7 +294,8 @@ def run_bench(spec: JobSpec) -> BenchResult:
             warnings.append(f"{name} case failed: {e}")
             return None
 
-    extra: dict[str, Any] = {"score_kind": "geomean_v2"}
+    # v3：等权几何平均，平铺 grader 两列（各 case 整体 tps + decode tps），不再内置 0.6/0.25/0.15。
+    extra: dict[str, Any] = {"score_kind": "geomean_v3"}
 
     if quick:
         # quick：单形状单 seed，便宜（agent 自检用），不测不规则。
@@ -289,6 +304,7 @@ def run_bench(spec: JobSpec) -> BenchResult:
         dc = _run("decode", _decode_events(2, 16, 4, vocab, gen, spec.device), 0, 1)
         prefill_tps = pf["tps"] if pf else 0.0
         decode_tps = dc["decode_tps"] if dc else 0.0
+        decode_overall_tps = dc["tps"] if dc else 0.0
         mixed_tps = 0.0
         mixed_decode_tps = 0.0
         peak = max((m["peak_memory_mb"] for m in (pf, dc) if m), default=0.0)
@@ -305,6 +321,7 @@ def run_bench(spec: JobSpec) -> BenchResult:
         pf = _run("prefill", pf_events, 1, 2)
 
         decode_list: list[float] = []
+        decode_overall_list: list[float] = []
         mixed_decode_list: list[float] = []
         mixed_tps_list: list[float] = []
         peaks: list[float] = [pf["peak_memory_mb"]] if pf else []
@@ -320,6 +337,7 @@ def run_bench(spec: JobSpec) -> BenchResult:
             )
             if dc_s:
                 decode_list.append(dc_s["decode_tps"])
+                decode_overall_list.append(dc_s["tps"])
                 peaks.append(dc_s["peak_memory_mb"])
             if _wall_hit():
                 break
@@ -333,6 +351,7 @@ def run_bench(spec: JobSpec) -> BenchResult:
 
         prefill_tps = pf["tps"] if pf else 0.0
         decode_tps = _agg(decode_list)
+        decode_overall_tps = _agg(decode_overall_list)
         mixed_decode_tps = _agg(mixed_decode_list)
         mixed_tps = _agg(mixed_tps_list)
         peak = max(peaks, default=0.0)
@@ -341,11 +360,12 @@ def run_bench(spec: JobSpec) -> BenchResult:
             "mixed_decode_tps": mixed_decode_list,
         }
 
-    score = _score(prefill_tps, decode_tps, mixed_decode_tps)
+    score = _score(prefill_tps, decode_tps, mixed_decode_tps, decode_overall_tps, mixed_tps)
     return BenchResult(
         mode=mode,
         prefill_tps=prefill_tps,
         decode_tps=decode_tps,
+        decode_overall_tps=decode_overall_tps,
         mixed_tps=mixed_tps,
         mixed_decode_tps=mixed_decode_tps,
         peak_memory_mb=peak,
