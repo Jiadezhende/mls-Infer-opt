@@ -78,7 +78,17 @@ def _evaluate_fake(
     )
     if passed:
         score = float(candidate.extra.get("fake_score", 0.0))
-        candidate.attach_bench(BenchResult(mode=mode, score=score, decode_tps=score))
+        # 真实 full bench 三类 tps 都有值；这里都置为 score，使父进程归一化（对 baseline 各类
+        # ratio）得 score/baseline_score，baseline(score=1.0) 下恰还原为 score，保持断言语义。
+        candidate.attach_bench(
+            BenchResult(
+                mode=mode,
+                score=score,
+                decode_tps=score,
+                mixed_decode_tps=score,
+                prefill_tps=score,
+            )
+        )
     return candidate
 
 

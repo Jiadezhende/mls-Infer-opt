@@ -29,7 +29,7 @@ from ..generate import repair as default_repair
 from ..state.candidate import Candidate, candidate_engine_path
 from ..state.common import to_dict, utcnow_iso
 from ..state.context import Environment, Limits, Paths, TaskContext
-from ..state.eval import EvalMode, ValidationError
+from ..state.eval import EvalMode, ValidationError, geomean_score
 from ..state.loop import AgentEvent, EventLevel, LoopState
 from ..state.policy import Policy
 
@@ -460,6 +460,35 @@ def _register_candidate(state: LoopState, candidate: Candidate) -> Candidate:
     return candidate
 
 
+def _normalize_score(state: LoopState, candidate: Candidate) -> None:
+    """把候选 bench.score 归一化为"对 baseline per-category tps 的加权几何平均加速比"。
+
+    参照系 = bootstrap baseline 的 per-category tps（自校准到真实评测硬件）。baseline 自身 ref 即
+    自身 → 各 ratio 1.0 → score 1.0；后续候选 score≈×baseline，让 keep-best 严格比较与 speedup
+    展示都有诚实语义。无 baseline（bootstrap 评测当下尚未冻结）或缺 bench 时安全跳过，保留 worker
+    临时自评。归一化在所有 score 消费者（keep_best / fmt_score_line / analyze）之前的唯一咽喉点。
+    """
+    bench = candidate.bench
+    if bench is None:
+        return
+    ref = state.baseline_candidate()
+    ref_bench = ref.bench if ref is not None else None
+    if ref_bench is None:
+        return
+
+    def _ratio(cand_tps: float, ref_tps: float) -> float:
+        # baseline 该类无数据（case 失败/0）→ ratio 中性 1.0，不让它把整体几何平均拖塌。
+        if ref_tps <= 1e-9:
+            return 1.0
+        return cand_tps / ref_tps
+
+    r_d = _ratio(bench.decode_tps, ref_bench.decode_tps)
+    r_m = _ratio(bench.mixed_decode_tps, ref_bench.mixed_decode_tps)
+    r_p = _ratio(bench.prefill_tps, ref_bench.prefill_tps)
+    bench.score = geomean_score(r_d, r_m, r_p)
+    bench.loss = -bench.score
+
+
 def _evaluate_candidate(
     state: LoopState,
     candidate: Candidate,
@@ -479,6 +508,7 @@ def _evaluate_candidate(
         _emit(state, f"evaluate 异常：{e}", "evaluate", level="error", candidate_id=candidate.id)
         return candidate
 
+    _normalize_score(state, candidate)
     passed = bool(candidate.gate and candidate.gate.passed)
     data: dict[str, Any] = {
         "passed": passed,

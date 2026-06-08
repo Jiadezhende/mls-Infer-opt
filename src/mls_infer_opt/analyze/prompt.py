@@ -70,11 +70,18 @@ SDPA、qkv/mlp 融合需 weight_layout=fused。数值敏感(🔴)轴可能顶破
 def _fmt_bench(b: BenchResult | None) -> str:
     if b is None:
         return "（best 尚无 bench 数据）"
-    return (
+    line = (
         f"score={b.score:.4f} loss={b.loss:.4f} | prefill_tps={b.prefill_tps:.1f} "
         f"decode_tps={b.decode_tps:.1f} mixed_tps={b.mixed_tps:.1f} "
         f"peak_mem={b.peak_memory_mb:.0f}MB"
     )
+    # 跨 seed 的 decode tps 离散度 = 抗不规则鲁棒性信号：min/max 拉得越开，说明对请求顺序越敏感，
+    # 是优化该优先收敛的方向。仅 full bench 的 extra 里有；缺则不追加。
+    per_seed = (b.extra or {}).get("per_seed", {})
+    ds = [v for v in per_seed.get("decode_tps", []) if v > 0]
+    if len(ds) >= 2:
+        line += f" | decode_tps×{len(ds)}seed [min={min(ds):.1f} max={max(ds):.1f}]"
+    return line
 
 
 def _fmt_failure(e: ValidationError) -> str:
