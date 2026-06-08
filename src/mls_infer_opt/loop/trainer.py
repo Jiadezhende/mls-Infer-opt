@@ -208,6 +208,9 @@ def run_loop(
         state.round = max(state.round, policy.round)
         if not improved:
             state.stale_rounds += 1
+        # 每轮落盘：不止 best 提升时刷 output3，使被 kill 时 rounds[] 含所有已完成轮（叙事抗-kill
+        # 与 results.log 事件级 append 对齐）。提升轮已在 keep_best 内刷过，这里覆盖一遍代价可忽略。
+        _publish_summary(state)
 
     _tick_budget(state, started)
     finalize(state, hooks=hooks, config=config)
@@ -611,6 +614,10 @@ def _summary(state: LoopState) -> dict[str, Any]:
     gate_fail_stage = ""
     if gate is not None and not gate.passed and gate.errors:
         gate_fail_stage = gate.errors[0].stage
+    rounds = _reasoning_trace(state)
+    # round 取「已执行轮数（含候选的 trace 条目）」与 state.round 的较大者：让 _publish_summary 的
+    # 中途快照不再比实际少一拍（state.round 在 _run_policy_round 返回后才 +1，而落盘发生在其内部）。
+    executed_rounds = sum(1 for r in rounds if r.get("candidate_id"))
     return {
         "run_id": state.task_context.run_id,
         "stop_reason": state.stop_reason,
@@ -618,7 +625,7 @@ def _summary(state: LoopState) -> dict[str, Any]:
         "best_score": state.best_score if math.isfinite(state.best_score) else None,
         "best_strategy_tags": list(best.strategy_tags) if best is not None else [],
         "n_candidates": len(state.candidates),
-        "round": state.round,
+        "round": max(state.round, executed_rounds),
         "stale_rounds": state.stale_rounds,
         "elapsed_s": state.budget.elapsed_s,
         "eval_runs": state.budget.eval_runs,
@@ -635,7 +642,7 @@ def _summary(state: LoopState) -> dict[str, Any]:
         "correctness_passed": bool(gate and gate.passed),
         "gate_stage_on_fail": gate_fail_stage,
         # —— 逐轮推理叙事（诊断→策略→评测→结论），让 output3.* 自带推理而非只摘要 ——
-        "rounds": _reasoning_trace(state),
+        "rounds": rounds,
     }
 
 
@@ -644,11 +651,14 @@ def _reasoning_trace(state: LoopState) -> list[dict[str, Any]]:
 
     以每条 analyze 事件为一轮的锚：取诊断（bottleneck）/方向（strategy_tags/knobs_delta）/理由
     （rationale=event.data["detail"]）/判定（continue|stop），再并入该 analyze 之后、下一条 analyze
-    之前最后一次 evaluate 的 {candidate_id, passed, score} 作结论。never-throw → []。
+    之前最后一次 evaluate 的 {candidate_id, passed, score} 作结论，并由 candidate_id 反查候选补上
+    分项 score_breakdown（哪个轴动了）、parent_id（从谁 fork——留痕贪心爬山）、delta（相对上一轮的
+    分数增量）。never-throw → []。
     """
     try:
         trace: list[dict[str, Any]] = []
         cur: dict[str, Any] | None = None
+        prev_score: float | None = None
         for ev in state.events:
             data = ev.data or {}
             if ev.source == "analyze":
@@ -668,8 +678,17 @@ def _reasoning_trace(state: LoopState) -> list[dict[str, Any]]:
                 # 该轮 analyze 之后的评测结论：覆盖式取最后一次（含 repair 后的最终评测）。
                 cur["candidate_id"] = ev.candidate_id
                 cur["passed"] = bool(data.get("passed", False))
-                if data.get("score") is not None:
-                    cur["score"] = data["score"]
+                score = data.get("score")
+                if score is not None:
+                    cur["score"] = score
+                    cur["delta"] = (score - prev_score) if prev_score is not None else None
+                    prev_score = score
+                # 由 candidate_id 反查候选：补分项（哪个轴动了）+ 血缘（从谁 fork）。
+                cand = state.candidates.get(ev.candidate_id) if ev.candidate_id else None
+                if cand is not None:
+                    if cand.bench is not None:
+                        cur["score_breakdown"] = present.score_breakdown(cand.bench)
+                    cur["parent_id"] = cand.parent_id
         return trace
     except Exception:  # noqa: BLE001 — 叙事采集绝不拖垮 finalize 落盘
         return []

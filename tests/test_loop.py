@@ -126,13 +126,31 @@ def _scripted_analyze(
 
 
 def _kv_policy(state: LoopState) -> Policy:
-    return aggregate(
+    policy = aggregate(
         {"kv_cache": "incremental"},
         kind="optimization",
         round=state.round + 1,
         parent_id=state.best_id,
         rationale="try kv cache",
     ).policy
+    # 镜像生产 analyze（grad.py）：每产一个 policy 都发一条 source="analyze" 的 continue 事件，
+    # 它是 _reasoning_trace 的逐轮锚（无此事件则该轮不进 rounds[]）。
+    state.add_event(
+        AgentEvent(
+            source="analyze",
+            phase="grad",
+            message="continue",
+            data={
+                "decision": "continue",
+                "used_llm": False,
+                "bottleneck": "kv",
+                "detail": "try kv cache",
+                "next_strategy_tags": strategy_tags(policy),
+                "knobs_delta": {},
+            },
+        )
+    )
+    return policy
 
 
 def test_run_loop_bootstraps_and_publishes_when_analyze_stops(tmp_path: Path):
@@ -197,6 +215,18 @@ def test_run_loop_promotes_strictly_better_candidate(tmp_path: Path):
     assert state.stale_rounds == 0
     assert Path(ctx.engine_publish_path).read_text(encoding="utf-8") == "optimized engine"
 
+    # 逐轮叙事每条自带分项（哪个轴动了）+ 血缘（从谁 fork）+ 增量。
+    output = json.loads((Path(ctx.paths.output_dir) / "output3.json").read_text(encoding="utf-8"))
+    r0 = output["rounds"][0]
+    assert r0["candidate_id"] == state.best_id
+    bd = r0["score_breakdown"]
+    assert bd["decode_tps"] == 2.0 and bd["prefill_tps"] == 2.0 and bd["mixed_decode_tps"] == 2.0
+    # 从 bootstrap baseline fork（贪心爬山留痕）。
+    assert r0["parent_id"] == make_candidate_id(0, "baseline engine")
+    assert r0["delta"] is None  # 首轮无前序，delta 为 None
+    # round 与含候选的轮数自洽（≥ state.round），不再比实际少一拍。
+    assert output["round"] == 1 and output["round"] >= state.round
+
 
 def test_run_loop_keeps_best_when_candidate_is_not_better(tmp_path: Path):
     ctx = _ctx(tmp_path)
@@ -221,6 +251,44 @@ def test_run_loop_keeps_best_when_candidate_is_not_better(tmp_path: Path):
     assert state.best_score == 1.0
     assert state.stale_rounds == 1
     assert Path(ctx.engine_publish_path).read_text(encoding="utf-8") == "baseline engine"
+
+
+def test_output3_records_non_improving_rounds_every_round(tmp_path: Path):
+    """每轮落盘：候选不及 best 也不刷新发布点，但该轮仍进 output3.rounds（叙事抗-kill）。"""
+
+    ctx = _ctx(tmp_path)
+
+    def bootstrap(ctx: TaskContext) -> Candidate:
+        return _persist_fake(ctx, default_policy(), "baseline engine", score=1.0)
+
+    def propose(
+        ctx: TaskContext, policy: Policy, parent_code: str, *, llm: Any | None
+    ) -> Candidate | None:
+        _ = (parent_code, llm)
+        return _persist_fake(ctx, policy, "slower engine", score=0.5)
+
+    hooks = LoopHooks(
+        bootstrap=bootstrap,
+        analyze=_scripted_analyze([_kv_policy, _kv_policy, None]),
+        propose=propose,
+        evaluate=_evaluate_fake,
+    )
+    state = run_loop(ctx, hooks=hooks, config=LoopConfig(safety_max_rounds=4))
+
+    # best 始终是 bootstrap baseline，两轮都没提升。
+    assert state.best_score == 1.0
+    assert Path(ctx.engine_publish_path).read_text(encoding="utf-8") == "baseline engine"
+
+    output = json.loads((Path(ctx.paths.output_dir) / "output3.json").read_text(encoding="utf-8"))
+    executed = [r for r in output["rounds"] if r.get("candidate_id")]
+    # 两个非提升轮都被记录，不因 best 未刷新而丢叙事。
+    assert len(executed) >= 2
+    # round 与含候选的轮数自洽。
+    assert output["round"] == len(executed) == state.round
+    # 非提升轮也带分项 + 血缘 + 增量。
+    assert executed[0]["score_breakdown"]["decode_tps"] == 0.5
+    assert executed[0]["parent_id"] == make_candidate_id(0, "baseline engine")
+    assert executed[1]["delta"] == 0.0  # 两轮同分，增量 0
 
 
 def test_run_loop_repairs_failed_candidate_and_promotes_repair(tmp_path: Path):
