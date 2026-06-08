@@ -18,19 +18,12 @@ export MLS_TIME_BUDGET_S="${MLS_TIME_BUDGET_S:-1680}"
 
 cd "$REPO_DIR"
 
-# --- LLM 凭证：用本仓库 .env 覆盖评测平台注入的 OPENAI_* -----------------------
-# 评测容器会往环境里注入一把课程 OPENAI_API_KEY（35 位），但不注入 OPENAI_BASE_URL，
-# 于是 key 用注入值、base_url 仍是我们 .env 的 xiaoai → key 与端点错配，每次
-# responses.create 都 401 Invalid token、generate 全程产不出候选、只发 baseline。
-# 这里把仓库 .env 整体 source 进环境（set -a 自动 export），让我们的 key/base_url/model
-# 成套覆盖注入值，保证三者同源。config._merged_env 里 shell 值压过 .env 文件，故这条
-# export 是权威。.env 不入库（.gitignore），凭证不会落进 git。
-if [ -f "$REPO_DIR/.env" ]; then
-  set -a
-  # shellcheck disable=SC1091
-  . "$REPO_DIR/.env"
-  set +a
-fi
+# --- LLM 凭证 ---------------------------------------------------------------
+# precedence 收敛在 config._merged_env 一处：本仓库 .env 对凭证（OPENAI_API_KEY /
+# OPENAI_BASE_URL / MLS_LLM_MODEL 等）逐键权威，环境变量仅在 .env 未设置时兜底。
+# 故评测容器注入的孤立 OPENAI_API_KEY（无 OPENAI_BASE_URL）不会与我们 .env 的 base_url
+# 错配 401。这里不再 source .env，避免 shell 层与 Python 层两套 precedence 打架。
+# .env 不入库（.gitignore），凭证不会落进 git。
 
 # 优先用本仓库 venv 的解释器（editable 安装），否则退回 PATH 上的 python3。
 PYTHON="python3"

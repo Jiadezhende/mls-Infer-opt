@@ -77,8 +77,10 @@ def _merged_env(
     shell_values = dict(env if env is not None else os.environ)
     dotenv_path = env_file or shell_values.get("MLS_LLM_ENV_FILE") or ".env"
     dotenv_values = _read_dotenv(dotenv_path)
-    # Exported shell values win over .env so CI/local overrides remain predictable.
-    return {**dotenv_values, **shell_values}
+    # 本服务 .env 是权威；环境变量仅在 .env 未设置（或留空）该键时兜底。逐键回退，
+    # 故评测容器注入的孤立 OPENAI_API_KEY 不会与我们 .env 的 base_url 错配（401 根因）。
+    overlay = {k: v for k, v in dotenv_values.items() if v != ""}
+    return {**shell_values, **overlay}
 
 
 @dataclass(frozen=True)
