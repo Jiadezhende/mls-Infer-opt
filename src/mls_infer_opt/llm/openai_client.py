@@ -57,6 +57,9 @@ class OpenAIAgentClient:
         self.config = config or LLMConfig.from_env()
         self._client = client
         self._unavailable_reason: str | None = None
+        # 最近一次 run_agent 失败的结构化 error（kind/message）——供上层（loop）记录「为什么这次
+        # 调用没成功」，而不是把网络/API 错误静默丢弃。
+        self._last_error: dict[str, Any] | None = None
         if self.config.disabled:
             self._unavailable_reason = "LLM disabled by MLS_LLM_DISABLED"
         elif self._client is None:
@@ -69,6 +72,11 @@ class OpenAIAgentClient:
     @property
     def unavailable_reason(self) -> str | None:
         return self._unavailable_reason
+
+    @property
+    def last_error(self) -> dict[str, Any] | None:
+        """最近一次 run_agent 失败的 error（kind/message），成功则保持上一次值。"""
+        return self._last_error
 
     def generate(self, prompt: str) -> str | None:
         result = self.run_agent(prompt)
@@ -84,14 +92,13 @@ class OpenAIAgentClient:
         instructions: str = "",
         max_tool_rounds: int | None = None,
     ) -> AgentResult:
+        self._last_error = None
         if not self.available:
-            return AgentResult(
-                ok=False,
-                error={
-                    "kind": "unavailable",
-                    "message": self._unavailable_reason or "LLM client is unavailable",
-                },
-            )
+            self._last_error = {
+                "kind": "unavailable",
+                "message": self._unavailable_reason or "LLM client is unavailable",
+            }
+            return AgentResult(ok=False, error=self._last_error)
 
         registry = ToolRegistry(tools or [])
         executor = ToolExecutor(registry, default_timeout_s=self.config.timeout_s)
@@ -124,12 +131,16 @@ class OpenAIAgentClient:
                     f"  agent r{round_index}: 调用工具 {[c.name for c in pending_calls]}"
                 )
                 if round_index >= rounds:
+                    self._last_error = {
+                        "kind": "max_tool_rounds",
+                        "message": "tool loop limit reached",
+                    }
                     return AgentResult(
                         ok=False,
                         text=text,
                         tool_calls=tool_records,
                         usage=_extract_usage(response),
-                        error={"kind": "max_tool_rounds", "message": "tool loop limit reached"},
+                        error=self._last_error,
                         raw=response,
                     )
 
@@ -157,13 +168,15 @@ class OpenAIAgentClient:
                         }
                     )
         except Exception as exc:
+            self._last_error = {"kind": type(exc).__name__, "message": str(exc)}
             return AgentResult(
                 ok=False,
                 tool_calls=tool_records,
-                error={"kind": type(exc).__name__, "message": str(exc)},
+                error=self._last_error,
             )
 
-        return AgentResult(ok=False, tool_calls=tool_records)
+        self._last_error = {"kind": "empty", "message": "model produced no final answer"}
+        return AgentResult(ok=False, tool_calls=tool_records, error=self._last_error)
 
     def _build_client(self) -> Any | None:
         if not self.config.can_attempt_request:

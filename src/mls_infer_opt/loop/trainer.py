@@ -166,6 +166,7 @@ def run_loop(
     _ensure_dirs(ctx)
     _install_observer(state)  # 每条事件实时(a)流 stderr、(b)增量 append results.log
     _emit(state, "loop 启动", "init", data={"run_id": ctx.run_id})
+    _emit_llm_status(state, llm)
 
     try:
         baseline = hooks.bootstrap(ctx)
@@ -383,11 +384,12 @@ def _run_policy_round(
         candidate = None
 
     if candidate is None:
+        reason = _llm_failure_reason(llm)
         _emit(
             state,
-            "本轮未产出候选",
+            "本轮未产出候选" + (f"（{reason}）" if reason else ""),
             "generate",
-            data={"policy_round": policy.round, "parent_id": state.best_id},
+            data={"policy_round": policy.round, "parent_id": state.best_id, "reason": reason},
         )
         return False
 
@@ -790,6 +792,41 @@ def _render_events(state: LoopState) -> str:
     if not state.events:
         return ""
     return "\n".join(present.render_event(e) for e in state.events) + "\n"
+
+
+def _emit_llm_status(state: LoopState, llm: Any | None) -> None:
+    """开局记录 LLM 可用性——不可用时把原因落进 results.log，杜绝降级被静默吞掉。
+
+    这条事件回答「为什么整轮 used_llm 都是 False」：缺 key / 没装 SDK / disabled 等真因在
+    client 构造时已算进 ``unavailable_reason``，这里把它显式留痕，而非事后靠时序猜。
+    """
+    available = bool(llm is not None and getattr(llm, "available", False))
+    if available:
+        _emit(state, "LLM 可用", "llm", data={"available": True})
+        return
+    reason = getattr(llm, "unavailable_reason", None) if llm is not None else None
+    reason = reason or "llm client 未装配（None）"
+    _emit(
+        state,
+        f"LLM 不可用，全程走规则兜底：{reason}",
+        "llm",
+        level="warning",
+        data={"available": False, "reason": reason},
+    )
+
+
+def _llm_failure_reason(llm: Any | None) -> str | None:
+    """提取本轮 generate 没出候选的 LLM 侧原因：不可用 → reason；可用但调用失败 → last_error。"""
+    if llm is None:
+        return "llm 未装配"
+    if not getattr(llm, "available", False):
+        return getattr(llm, "unavailable_reason", None) or "llm 不可用"
+    err = getattr(llm, "last_error", None)
+    if isinstance(err, dict):
+        kind = err.get("kind", "?")
+        msg = str(err.get("message", ""))[:200]
+        return f"llm 调用失败: {kind}: {msg}"
+    return None
 
 
 def _emit(
