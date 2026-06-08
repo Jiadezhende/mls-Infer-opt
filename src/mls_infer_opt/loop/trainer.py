@@ -800,19 +800,42 @@ def _emit_llm_status(state: LoopState, llm: Any | None) -> None:
     这条事件回答「为什么整轮 used_llm 都是 False」：缺 key / 没装 SDK / disabled 等真因在
     client 构造时已算进 ``unavailable_reason``，这里把它显式留痕，而非事后靠时序猜。
     """
+    fp = _llm_fingerprint(llm)
     available = bool(llm is not None and getattr(llm, "available", False))
     if available:
-        _emit(state, "LLM 可用", "llm", data={"available": True})
+        _emit(
+            state,
+            f"LLM 可用：key={fp['api_key']} base_url={fp['base_url']} model={fp['model']}",
+            "llm",
+            data={"available": True, **fp},
+        )
         return
     reason = getattr(llm, "unavailable_reason", None) if llm is not None else None
     reason = reason or "llm client 未装配（None）"
     _emit(
         state,
-        f"LLM 不可用，全程走规则兜底：{reason}",
+        f"LLM 不可用，全程走规则兜底：{reason}"
+        f"（key={fp['api_key']} base_url={fp['base_url']} model={fp['model']}）",
         "llm",
         level="warning",
-        data={"available": False, "reason": reason},
+        data={"available": False, "reason": reason, **fp},
     )
+
+
+def _llm_fingerprint(llm: Any | None) -> dict[str, Any]:
+    """运行时实际加载的 LLM 凭证指纹（脱敏）——回答「到底用了哪把 key / 哪个端点」。
+
+    key 只留头 8 + 尾 4 + 长度，绝不落全量；base_url / model 原样留痕。专治「评测环境加载了
+    与本地不同的 .env / 被注入了别的 OPENAI_*」这类只在 submit 复现、本地看不出的环境问题。
+    """
+    cfg = getattr(llm, "config", None)
+    key = getattr(cfg, "api_key", None) or ""
+    masked = f"{key[:8]}…{key[-4:]}(len={len(key)})" if key else "(empty)"
+    return {
+        "api_key": masked,
+        "base_url": getattr(cfg, "base_url", None),
+        "model": getattr(cfg, "model", None),
+    }
 
 
 def _llm_failure_reason(llm: Any | None) -> str | None:
