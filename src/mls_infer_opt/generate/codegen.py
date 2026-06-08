@@ -6,11 +6,14 @@
 - ``propose``：按 Policy（带 analyze 的 rationale）产新候选（LLM）。
 - ``repair``：按结构化报错定向修复候选（LLM）。
 
-propose/repair 不是「调一次」：generate 调 LLM 出 ``engine.py`` → 自己跑
-``check_self_contained``（静态）+ ``evaluate.quick_gate``（子进程隔离、对 oracle 比 logits）→
-不过就把结构化错误回灌、转 repair 提示让模型修自己的码，循环到过门或耗自检预算。控制权全程在
-确定性代码里（不靠模型自觉调工具）。**自检 ephemeral、不进 state**；挂到 candidate.gate 的只有
-外层 loop 跑的 full gate（权威，不变量 #5）。无权重无法自检时优雅降级为「静态过即出候选」。
+propose/repair 不是「调一次」：把 ``check_engine`` 工具（包 ``check_self_contained`` 静态 +
+``evaluate.quick_gate`` 子进程隔离对 oracle 比 logits）交给 agent，让它**边写边自检**——写完整
+``engine.py`` → 调 ``check_engine(code=…)`` → 按返回的结构化 ``errors`` 修自己的码 → 再调，直到
+``passed=true`` 或耗 tool-loop 预算（``run_agent`` 的 ``max_tool_rounds``）。自检循环在 agent 内部，
+不再靠确定性外层 Python 驱动。仅有旧式 ``generate(prompt)``（无 ``run_agent``）的 client 退化为
+「一次性出码 + 确定性静态/quick 复核」。**自检 ephemeral、不进 state**；只持久化「最近一次过
+check_engine 的码」，挂到 candidate.gate 的只有外层 loop 跑的 full gate（权威，不变量 #5）。
+无权重无法自检时优雅降级为「静态过即出候选」。
 
 不变量：本模块只产候选、无发布权；**LLM 不可用 / 失败 / 产垃圾 / 自检始终不过 → 返回 None**
 （loop 当作「这轮没收益」走兜底），绝不抛异常给上层。成功则把 engine.py + policy.json 落到
@@ -22,10 +25,15 @@ from __future__ import annotations
 import ast
 import os
 import re
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from ..evaluate import quick_gate
+
+# 直 import tooling（仅依赖 stdlib）而非 ..llm：避免经 llm/__init__ 拉入
+# openai_client→present 的导入环。
+from ..llm.tooling import ToolResult, ToolSpec
 from ..searchspace.policy import Policy, default_policy, strategy_tags, to_json
 from ..state.candidate import (
     Candidate,
@@ -34,7 +42,7 @@ from ..state.candidate import (
     make_candidate_id,
 )
 from ..state.context import TaskContext
-from ..state.eval import GateResult, GateStage, ValidationError
+from ..state.eval import GateResult, ValidationError
 from .prompt import PromptMode, build_prompt
 
 __all__ = [
@@ -48,8 +56,25 @@ __all__ = [
 
 _BASELINE_PATH = Path(__file__).parent / "assets" / "baseline_engine.py"
 
-# 自检重试预算：generate 内部循环上限（与外层 loop 的 max_repair_retries 不同层）。
+# 自检重试预算：agent tool-loop 上限（与外层 loop 的 max_repair_retries 不同层）。
 _MAX_SELF_CHECK_ROUNDS = 4
+
+# check_engine 工具的执行超时：必须 ≥ quick_gate 子进程预算 + 余量，否则 ToolExecutor 的
+# ThreadPoolExecutor 会按 LLMConfig.timeout_s（默认 120s）提前 cancel、孤儿化 quick_gate 子进程。
+_CHECK_ENGINE_TOOL_TIMEOUT_S = 600.0
+
+# 交给 agent 的自检指令：让它边写边用 check_engine 自检，而非一次性出码。
+_AGENT_SELF_CHECK_INSTRUCTIONS = (
+    "你在生成一份自包含的 engine.py。流程：\n"
+    "1. 写出完整的 engine.py 源码。\n"
+    "2. 调用 check_engine(code=<完整源码>) 自检——它跑静态规则 + quick 正确性门，"
+    "返回 {passed, errors}。\n"
+    "3. 若 passed=false，按 errors 修正你自己的代码，再次调用 check_engine；"
+    "重复直到 passed=true。\n"
+    "4. 你最近一次让 check_engine 返回 passed=true 的入参代码，就是最终采用的 engine.py——"
+    "务必让那次调用包含完整、可直接运行的单文件源码。\n"
+    "不要 import mls_infer_opt；遵守 prompt 里的 API 契约与自包含硬规则。"
+)
 
 # 自包含 import 白名单：根模块必须在内；engine 应是纯 torch，余量给常见 stdlib。
 _ALLOWED_IMPORT_ROOTS = frozenset(
@@ -142,50 +167,160 @@ def _generate(
     errors: list[ValidationError] | None,
     max_self_check_rounds: int = _MAX_SELF_CHECK_ROUNDS,
 ) -> Candidate | None:
-    """自检重试自闭环：出码 → 静态/quick 自检 → 不过则带错回灌转 repair，循环到过门或耗预算。
+    """产一份候选：有 run_agent 的 client 走 agent 工具自检自闭环，否则退化为一次性出码 + 复核。
 
-    首轮按入参 mode/parent_code/errors；任一轮自检不过后，把模型自己产的码作 parent、转 repair
-    提示、回灌结构化错误，让它修自己的代码。仅当过 quick（或无权重无法自检）才出候选。
+    agent 路径：把 check_engine 工具交给模型，让它写完整 engine.py → 自检 → 按 errors 修自己的码 →
+    重调，直到过门（run_agent 内部 tool-loop，上限 max_self_check_rounds）。只持久化「最近一次过
+    check_engine 的码」；模型从没成功调用工具时回退抽取最终文本并确定性复核。
+    legacy 路径：一次性 ``generate(prompt)`` → 抽码 → 静态 + quick 复核 → 过才出候选。
 
-    **永不抛**（不变量 #3/#5）：LLM 调用 / build_prompt / 暂存写盘 / quick_gate / 落盘 任一异常都
-    收敛为「这轮无收益」（None），绝不漏给 loop。单次 LLM 失败只跳过本轮、在预算内重试。
+    **永不抛**（不变量 #3/#5）：build_prompt / run_agent / 暂存写盘 / quick_gate / 落盘 任一异常都
+    收敛为「这轮无收益」（None），绝不漏给 loop。仅当过 quick（或无权重无法自检）才出候选。
     """
     if llm is None or not getattr(llm, "available", False):
         return None
 
-    cur_mode: PromptMode = "repair" if mode == "repair" else "propose"
-    cur_parent = parent_code
-    cur_errors = errors
-
+    prompt_mode: PromptMode = "repair" if mode == "repair" else "propose"
     try:
-        for _ in range(max(1, max_self_check_rounds)):
-            prompt = build_prompt(
-                policy, ctx, mode=cur_mode, parent_code=cur_parent, errors=cur_errors
+        runner = getattr(llm, "run_agent", None)
+        if callable(runner):
+            return _generate_agent_loop(
+                ctx,
+                policy,
+                parent_code,
+                mode=prompt_mode,
+                llm=llm,
+                errors=errors,
+                max_self_check_rounds=max_self_check_rounds,
             )
-            try:
-                text = _call_llm(llm, prompt)
-            except Exception:
-                continue  # 瞬时失败（含超时）：跳过本轮、在预算内重试（max_retries=0 兜底）
-            code = _extract_code(text) if text else None
-            if code is None:
-                continue  # 没产出代码块：再给一次机会（仍受预算上限约束）
-
-            static = check_self_contained(code)
-            if static:  # 静态不过：省掉子进程，直接回灌错误让模型修自己的码。
-                cur_mode, cur_parent = "repair", code
-                cur_errors = [_static_to_error(p) for p in static]
-                continue
-
-            gate = _quick_self_check(ctx, code)
-            if gate is None or gate.passed:  # 过 quick（或无权重无法自检）→ 出候选。
-                return _persist(ctx, policy, code)
-
-            cur_mode, cur_parent, cur_errors = "repair", code, gate.errors  # correctness 错回灌
+        return _generate_legacy(
+            ctx, policy, parent_code, mode=prompt_mode, llm=llm, errors=errors
+        )
     except Exception:
-        # build_prompt / 暂存 / 落盘 等任何意外 → 无收益，不漏给 loop（never-throw，不变量 #3/#5）。
+        # build_prompt / run_agent / 暂存 / 落盘 等任何意外 → 无收益，不漏给 loop（never-throw）。
         return None
 
-    return None  # 耗尽自检预算仍未过 quick → 这轮无收益（不变量 #2 兜底）
+
+def _generate_agent_loop(
+    ctx: TaskContext,
+    policy: Policy,
+    parent_code: str,
+    *,
+    mode: PromptMode,
+    llm: LLMClient,
+    errors: list[ValidationError] | None,
+    max_self_check_rounds: int,
+) -> Candidate | None:
+    """agent 持有 check_engine 工具、内部边写边自检；返回过门候选或 None。"""
+    prompt = build_prompt(policy, ctx, mode=mode, parent_code=parent_code, errors=errors)
+    captured: dict[str, str] = {}
+    tool = _build_check_engine_tool(ctx, captured)
+    result = llm.run_agent(  # type: ignore[attr-defined]
+        prompt,
+        tools=[tool],
+        instructions=_AGENT_SELF_CHECK_INSTRUCTIONS,
+        max_tool_rounds=max(1, max_self_check_rounds),
+    )
+
+    code = captured.get("code")
+    if code is not None:  # agent 已让 check_engine 返回 passed → 该码即已验证
+        return _persist(ctx, policy, code)
+
+    # 回退：模型没成功调用工具（或末次没过）→ 抽最终文本，确定性复核后才出候选。
+    # 绝不持久化未经 gate 的码。
+    text = getattr(result, "text", None) if getattr(result, "ok", False) else None
+    code = _extract_code(text) if text else None
+    if code is None or check_self_contained(code):
+        return None
+    gate = _quick_self_check(ctx, code)
+    if gate is None or gate.passed:
+        return _persist(ctx, policy, code)
+    return None
+
+
+def _generate_legacy(
+    ctx: TaskContext,
+    policy: Policy,
+    parent_code: str,
+    *,
+    mode: PromptMode,
+    llm: LLMClient,
+    errors: list[ValidationError] | None,
+) -> Candidate | None:
+    """仅有 ``generate(prompt)`` 的 client：一次性出码 + 静态/quick 复核（无内层循环）。"""
+    prompt = build_prompt(policy, ctx, mode=mode, parent_code=parent_code, errors=errors)
+    text = llm.generate(prompt)
+    code = _extract_code(text) if text else None
+    if code is None or check_self_contained(code):
+        return None
+    gate = _quick_self_check(ctx, code)
+    if gate is None or gate.passed:
+        return _persist(ctx, policy, code)
+    return None
+
+
+def _build_check_engine_tool(ctx: TaskContext, captured: dict[str, str]) -> ToolSpec:
+    """造 agent 的内层自检工具：收完整 engine.py 源码 → 静态 + quick 门 → {passed, errors}。
+
+    过门（或无权重无法自检的降级）时把该码写进 ``captured``，供调用方持久化；不过则只回错误、不写。
+    自检 ephemeral：只写 run_dir/_staging、不进 LoopState。handler 防御式产 ToolResult。
+    """
+
+    def _handler(args: Mapping[str, Any]) -> ToolResult:
+        code = args.get("code")
+        if not isinstance(code, str) or not code.strip():
+            return ToolResult.failure("invalid_arguments", "code 必须是非空源码字符串")
+
+        static = check_self_contained(code)
+        if static:
+            return ToolResult.success({"passed": False, "errors": static})
+
+        gate = _quick_self_check(ctx, code)
+        if gate is None:  # 无权重 / 暂存写失败：无法 quick 自检，降级交外层 full gate 把关
+            captured["code"] = code
+            return ToolResult.success(
+                {"passed": True, "errors": [], "note": "static-only (no weights)"}
+            )
+        if gate.passed:
+            captured["code"] = code
+            return ToolResult.success({"passed": True, "errors": []})
+        return ToolResult.success(
+            {"passed": False, "errors": [_error_to_payload(e) for e in gate.errors]}
+        )
+
+    return ToolSpec(
+        name="check_engine",
+        description=(
+            "校验候选 engine.py：跑自包含静态规则 + quick 正确性门（对官方 reference 比 logits）。"
+            "返回 {passed: bool, errors: [...]}；passed=false 时按 errors 修代码后重试。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {"code": {"type": "string"}},
+            "required": ["code"],
+            "additionalProperties": False,
+        },
+        handler=_handler,
+        timeout_s=_CHECK_ENGINE_TOOL_TIMEOUT_S,
+    )
+
+
+def _error_to_payload(e: ValidationError) -> dict[str, Any]:
+    """把 ValidationError 摊成 JSON 友好 dict 喂回模型修码（对齐 prompt._format_error 的字段）。"""
+    payload: dict[str, Any] = {"stage": e.stage, "message": e.message}
+    if e.case:
+        payload["case"] = e.case
+    if e.expected_shape is not None:
+        payload["expected_shape"] = e.expected_shape
+    if e.actual_shape is not None:
+        payload["actual_shape"] = e.actual_shape
+    if e.max_abs_err is not None:
+        payload["max_abs_err"] = e.max_abs_err
+    if e.max_rel_err is not None:
+        payload["max_rel_err"] = e.max_rel_err
+    if e.traceback_tail:
+        payload["traceback_tail"] = e.traceback_tail
+    return payload
 
 
 def _quick_self_check(ctx: TaskContext, code: str) -> GateResult | None:
@@ -203,25 +338,6 @@ def _quick_self_check(ctx: TaskContext, code: str) -> GateResult | None:
     except OSError:
         return None  # 写暂存失败：无法自检，降级交外层 full gate 把关
     return quick_gate(staging, ctx)
-
-
-def _static_to_error(problem: str) -> ValidationError:
-    """把静态问题字符串包成 ValidationError（喂 build_prompt 的 repair 块）。"""
-    stage: GateStage = "syntax" if "syntax" in problem else "api"
-    return ValidationError(stage=stage, message=problem)
-
-
-def _call_llm(llm: LLMClient, prompt: str) -> str | None:
-    """Call either the new agent API or the legacy generate(prompt) API."""
-
-    runner = getattr(llm, "run_agent", None)
-    if callable(runner):
-        result = runner(prompt)
-        if not getattr(result, "ok", False):
-            return None
-        text = getattr(result, "text", None)
-        return text if isinstance(text, str) else None
-    return llm.generate(prompt)
 
 
 def _extract_code(text: str) -> str | None:

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+from pathlib import Path
 
 import pytest
 
@@ -13,8 +15,8 @@ from mls_infer_opt.generate import (
     propose,
     repair,
 )
-from mls_infer_opt.generate.codegen import _BASELINE_PATH
-from mls_infer_opt.llm import FakeAgentClient
+from mls_infer_opt.generate.codegen import _BASELINE_PATH, _MAX_SELF_CHECK_ROUNDS
+from mls_infer_opt.llm import FakeAgentClient, LLMConfig, OpenAIAgentClient
 from mls_infer_opt.searchspace import aggregate, default_policy, merge
 from mls_infer_opt.state.candidate import candidate_engine_path
 from mls_infer_opt.state.context import Paths, TaskContext
@@ -297,65 +299,114 @@ def test_policy_dataclass_lives_in_state():
     assert StatePolicy.__module__ == "mls_infer_opt.state.policy"
 
 
-# === 6. 自检重试自闭环（generate 驱动；需 torch + 权重） ==============
-def test_propose_degrades_without_weights_emits_immediately(tmp_path):
-    """无 model.pt → 无法 quick 自检 → 静态过即出候选，不重试、不起子进程。"""
-    ctx = make_ctx(tmp_path)  # make_ctx 不写权重
-    policy = default_policy()
-    llm = FakeAgentClient([f"```python\n{BASELINE_CODE}\n```"])
+# === 6. agent 工具自检自闭环（真 OpenAIAgentClient + 脚本化 Responses；需 torch + 权重）====
+class _FakeResponses:
+    """脚本化 Responses.create：按序吐 output（dict）或抛 Exception（测 never-throw）。"""
+
+    def __init__(self, outputs) -> None:
+        self.outputs = outputs
+        self.calls: list[dict] = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        nxt = self.outputs.pop(0)
+        if isinstance(nxt, Exception):
+            raise nxt
+        return nxt
+
+
+class _FakeOpenAI:
+    def __init__(self, outputs) -> None:
+        self.responses = _FakeResponses(outputs)
+
+
+def _check_engine_call(code: str, call_id: str = "c1") -> dict:
+    """一轮模型请求调 check_engine(code=...) 的 Responses output item。"""
+    return {
+        "output": [
+            {
+                "type": "function_call",
+                "name": "check_engine",
+                "arguments": json.dumps({"code": code}),
+                "call_id": call_id,
+            }
+        ]
+    }
+
+
+def _final_message(text: str = "done") -> dict:
+    """一轮模型给最终答复、无更多工具调用 → agent 收束。"""
+    return {"output_text": text, "output": []}
+
+
+def _agent_client(outputs) -> tuple[OpenAIAgentClient, _FakeOpenAI]:
+    fake = _FakeOpenAI(outputs)
+    return OpenAIAgentClient(LLMConfig(api_key="x"), client=fake), fake
+
+
+def test_propose_agent_loop_degrades_without_weights(tmp_path):
+    """无 model.pt → check_engine 静态过即放行（quick 跳过）→ 出候选；落盘码即 agent 提交码。"""
+    ctx = make_ctx(tmp_path)  # 不写权重
+    policy = aggregate(
+        {"attention": "sdpa"}, kind="optimization", round=1, parent_id="r0-base"
+    ).policy
+    llm, fake = _agent_client([_check_engine_call(BASELINE_CODE), _final_message()])
+
+    cand = propose(ctx, policy, parent_code=BASELINE_CODE, llm=llm)
+    assert cand is not None and cand.kind == "optimization"
+    persisted = Path(candidate_engine_path(ctx.run_dir, cand.id)).read_text(encoding="utf-8")
+    assert persisted == BASELINE_CODE  # 持久化「过 check_engine 的码」
+    # 模型确实拿到了 check_engine 工具
+    assert "check_engine" in [t["name"] for t in fake.responses.calls[0]["tools"]]
+
+
+def test_propose_agent_loop_passes_quick_gate_with_weights(tmp_path):
+    """有权重 → check_engine 真跑 quick_gate 子进程 → baseline 过门 → 出候选。"""
+    pytest.importorskip("torch")
+    ctx = make_ctx(tmp_path)
+    _write_toy_weights(ctx)
+    policy = aggregate({"attention": "sdpa"}, kind="optimization", parent_id="r0-base").policy
+    llm, _ = _agent_client([_check_engine_call(BASELINE_CODE), _final_message()])
+
+    cand = propose(ctx, policy, parent_code=BASELINE_CODE, llm=llm)
+    assert cand is not None and cand.kind == "optimization"
+
+
+def test_propose_agent_loop_retries_then_fixes_on_error(tmp_path):
+    """首次提交静态不过 → check_engine 回 errors → agent 改对 → 出候选；落盘是修好的码。"""
+    pytest.importorskip("torch")
+    ctx = make_ctx(tmp_path)
+    _write_toy_weights(ctx)
+    policy = aggregate({"attention": "sdpa"}, kind="optimization", parent_id="r0-base").policy
+    bad = "import mls_infer_opt\n" + BASELINE_CODE  # forbidden import → 静态不过、不写 captured
+    llm, fake = _agent_client(
+        [_check_engine_call(bad, "c1"), _check_engine_call(BASELINE_CODE, "c2"), _final_message()]
+    )
 
     cand = propose(ctx, policy, parent_code=BASELINE_CODE, llm=llm)
     assert cand is not None
-    assert len(llm.prompts) == 1  # 一次出码、直接放行
+    persisted = Path(candidate_engine_path(ctx.run_dir, cand.id)).read_text(encoding="utf-8")
+    assert persisted == BASELINE_CODE and "import mls_infer_opt" not in persisted  # captured-wins
+    assert len(fake.responses.calls) == 3  # 两次 check_engine + 终轮 message
 
 
-def test_propose_passes_quick_gate_with_weights(tmp_path):
-    """有权重 → 真跑 quick_gate（子进程）→ baseline 过门 → 出候选。"""
-    pytest.importorskip("torch")
-    ctx = make_ctx(tmp_path)
-    _write_toy_weights(ctx)
-    policy = aggregate({"attention": "sdpa"}, kind="optimization", parent_id="r0-base").policy
-    llm = FakeAgentClient([f"```python\n{BASELINE_CODE}\n```"])
-
-    cand = propose(ctx, policy, parent_code=BASELINE_CODE, llm=llm)
-    assert cand is not None and cand.kind == "optimization"
-    assert len(llm.prompts) == 1  # 首次即过 quick
-
-
-def test_propose_self_check_retries_on_static_failure(tmp_path):
-    """首轮静态不过 → 回灌结构化错误、转 repair 提示 → 次轮修对 → 出候选。"""
-    pytest.importorskip("torch")
-    ctx = make_ctx(tmp_path)
-    _write_toy_weights(ctx)
-    policy = aggregate({"attention": "sdpa"}, kind="optimization", parent_id="r0-base").policy
-    bad = f"```python\nimport mls_infer_opt\n{BASELINE_CODE}\n```"  # forbidden import → 静态不过
-    good = f"```python\n{BASELINE_CODE}\n```"
-    llm = FakeAgentClient([bad, good])
-
-    cand = propose(ctx, policy, parent_code=BASELINE_CODE, llm=llm)
-    assert cand is not None and cand.kind == "optimization"
-    assert len(llm.prompts) == 2
-    # 次轮 prompt 含首轮错误且切到 repair 模式（修自己的码）
-    assert "forbidden import" in llm.prompts[1]
-    assert "待修复" in llm.prompts[1]
-
-
-def test_propose_never_throws_on_llm_exception_each_round(tmp_path):
-    """每轮 LLM 调用都抛 → 守卫成 None（不漏给 loop），并在预算内逐轮重试。"""
+def test_propose_agent_loop_never_throws_on_create_exception(tmp_path):
+    """Responses.create 抛错 → run_agent 内部吞成 ok=False → 回退无码 → None（不漏给 loop）。"""
     ctx = make_ctx(tmp_path)
     policy = default_policy()
-    llm = FakeAgentClient([RuntimeError("net")] * 4)
+    llm, _ = _agent_client([RuntimeError("net")])
 
     assert propose(ctx, policy, parent_code=BASELINE_CODE, llm=llm) is None
-    assert len(llm.prompts) == 4  # 异常逐轮跳过、耗满自检预算，never-throw
 
 
-def test_propose_returns_none_when_self_check_never_passes(tmp_path):
-    """持续产静态不过的码 → 耗尽自检预算 → None（这轮无收益）。"""
+def test_propose_agent_loop_returns_none_when_never_passes(tmp_path):
+    """恒提交静态不过的码 → 触顶 max_tool_rounds、ok=False → None（这轮无收益）。"""
     ctx = make_ctx(tmp_path)
     policy = default_policy()
     bad = "import mls_infer_opt\nthis is not valid python ："
-    llm = FakeAgentClient([bad] * 10)
+    # max_tool_rounds=_MAX_SELF_CHECK_ROUNDS → 客户端最多 rounds+1 次 create
+    outputs = [_check_engine_call(bad, f"c{i}") for i in range(_MAX_SELF_CHECK_ROUNDS + 1)]
+    llm, fake = _agent_client(outputs)
 
     assert propose(ctx, policy, parent_code=BASELINE_CODE, llm=llm) is None
-    assert len(llm.prompts) == 4  # _MAX_SELF_CHECK_ROUNDS
+    assert len(fake.responses.calls) == _MAX_SELF_CHECK_ROUNDS + 1  # 触顶自检预算
