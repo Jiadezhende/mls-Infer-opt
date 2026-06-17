@@ -44,8 +44,7 @@ class _PendingToolCall:
 class OpenAIAgentClient:
     """Small, defensive wrapper around OpenAI Responses API.
 
-    The class deliberately mirrors the existing generate.LLMClient protocol via
-    generate(prompt), while also exposing run_agent(prompt, tools=...).
+    Exposes the single run_agent(prompt, tools=...) entry that generate/analyze drive.
     """
 
     def __init__(
@@ -77,12 +76,6 @@ class OpenAIAgentClient:
     def last_error(self) -> dict[str, Any] | None:
         """最近一次 run_agent 失败的 error（kind/message），成功则保持上一次值。"""
         return self._last_error
-
-    def generate(self, prompt: str) -> str | None:
-        result = self.run_agent(prompt)
-        if not result.ok:
-            return None
-        return result.text
 
     def run_agent(
         self,

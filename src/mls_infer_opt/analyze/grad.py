@@ -29,14 +29,16 @@ __all__ = ["LLMClient", "analyze"]
 
 
 class LLMClient(Protocol):
-    """analyze 需要的最小 LLM 接口；与 generate 一致：优先 run_agent，兼容旧 generate(prompt)。
+    """analyze 需要的最小 LLM 接口；与 generate 一致，统一走 run_agent。
 
     ``available`` 为假或调用抛错 / 返回空时，analyze 退回 rule-based（不抛异常）。
     """
 
     available: bool
 
-    def generate(self, prompt: str) -> str | None: ...
+    def run_agent(
+        self, prompt: str, tools: list[Any] | None = ..., **kwargs: Any
+    ) -> Any: ...
 
 
 def analyze(state: LoopState, *, llm: LLMClient | None = None) -> Policy | None:
@@ -125,15 +127,15 @@ def _ask_llm(
 
 
 def _call_llm(llm: LLMClient, prompt: str) -> str | None:
-    """优先新 run_agent（取 .text），兼容旧 generate(prompt)。"""
+    """走 run_agent 取 .text；无 run_agent 或 ok=False → None（analyze 退回 rule-based）。"""
     runner = getattr(llm, "run_agent", None)
-    if callable(runner):
-        result = runner(prompt)
-        if not getattr(result, "ok", False):
-            return None
-        text = getattr(result, "text", None)
-        return text if isinstance(text, str) else None
-    return llm.generate(prompt)
+    if not callable(runner):
+        return None
+    result = runner(prompt)
+    if not getattr(result, "ok", False):
+        return None
+    text = getattr(result, "text", None)
+    return text if isinstance(text, str) else None
 
 
 def _load_best_policy(state: LoopState) -> Policy:

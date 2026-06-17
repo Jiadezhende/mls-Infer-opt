@@ -86,19 +86,6 @@ def _write_toy_weights(ctx: TaskContext) -> None:
     torch.save(sd, os.path.join(ctx.weight_dir, "model.pt"))
 
 
-class FakeLLM:
-    """最小 mock：available + generate(prompt)。text 为 Exception 时抛错（测兜底）。"""
-
-    def __init__(self, text, available: bool = True) -> None:
-        self.text = text
-        self.available = available
-
-    def generate(self, prompt: str):
-        if isinstance(self.text, Exception):
-            raise self.text
-        return self.text
-
-
 def _load_engine_module(path: str):
     spec = importlib.util.spec_from_file_location("cand_engine_under_test", path)
     assert spec is not None and spec.loader is not None
@@ -227,13 +214,13 @@ def test_bootstrap_engine_runs(tmp_path):
     assert tuple(out3.shape) == (1, vocab)
 
 
-# === 4. propose/repair 编排兜底（mock LLM） ===================
+# === 4. propose/repair 编排兜底（模型只回文本、没调工具 → 抽码 + 确定性复核的回退路径） ===
 def test_propose_persists_candidate_on_good_llm(tmp_path):
     ctx = make_ctx(tmp_path)
     policy = aggregate(
         {"attention": "sdpa"}, kind="optimization", round=1, parent_id="r0-base"
     ).policy
-    llm = FakeLLM(f"好的：\n```python\n{BASELINE_CODE}\n```\n完成")
+    llm = FakeAgentClient([f"好的：\n```python\n{BASELINE_CODE}\n```\n完成"])
 
     cand = propose(ctx, policy, parent_code=BASELINE_CODE, llm=llm)
     assert cand is not None
@@ -248,21 +235,21 @@ def test_propose_persists_candidate_on_good_llm(tmp_path):
 def test_propose_returns_none_on_garbage(tmp_path):
     ctx = make_ctx(tmp_path)
     policy = default_policy()
-    llm = FakeLLM("no code here at all")
+    llm = FakeAgentClient(["no code here at all"])
     assert propose(ctx, policy, parent_code=BASELINE_CODE, llm=llm) is None
 
 
 def test_propose_returns_none_on_llm_exception(tmp_path):
     ctx = make_ctx(tmp_path)
     policy = default_policy()
-    llm = FakeLLM(RuntimeError("boom"))
+    llm = FakeAgentClient([RuntimeError("boom")])
     assert propose(ctx, policy, parent_code=BASELINE_CODE, llm=llm) is None
 
 
 def test_propose_returns_none_when_unavailable(tmp_path):
     ctx = make_ctx(tmp_path)
     policy = default_policy()
-    down = FakeLLM("x", available=False)
+    down = FakeAgentClient([], available=False)
     assert propose(ctx, policy, parent_code=BASELINE_CODE, llm=down) is None
     assert propose(ctx, policy, parent_code=BASELINE_CODE, llm=None) is None
 
@@ -271,7 +258,7 @@ def test_repair_persists_candidate(tmp_path):
     ctx = make_ctx(tmp_path)
     policy = aggregate({}, kind="repair", round=2, parent_id="r1-bbbb").policy
     err = ValidationError(stage="syntax", message="unexpected indent")
-    llm = FakeLLM(f"```python\n{BASELINE_CODE}\n```")
+    llm = FakeAgentClient([f"```python\n{BASELINE_CODE}\n```"])
     cand = repair(ctx, policy, parent_code=BASELINE_CODE, errors=[err], llm=llm)
     assert cand is not None and cand.kind == "repair"
 

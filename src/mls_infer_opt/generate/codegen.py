@@ -10,8 +10,8 @@ propose/repair 不是「调一次」：把 ``check_engine`` 工具（包 ``check
 ``evaluate.quick_gate`` 子进程隔离对 oracle 比 logits）交给 agent，让它**边写边自检**——写完整
 ``engine.py`` → 调 ``check_engine(code=…)`` → 按返回的结构化 ``errors`` 修自己的码 → 再调，直到
 ``passed=true`` 或耗 tool-loop 预算（``run_agent`` 的 ``max_tool_rounds``）。自检循环在 agent 内部，
-不再靠确定性外层 Python 驱动。仅有旧式 ``generate(prompt)``（无 ``run_agent``）的 client 退化为
-「一次性出码 + 确定性静态/quick 复核」。**自检 ephemeral、不进 state**；只持久化「最近一次过
+不再靠确定性外层 Python 驱动。client 必须提供 ``run_agent``；模型若始终没成功调用工具，则回退抽取
+最终文本并做一次确定性静态/quick 复核。**自检 ephemeral、不进 state**；只持久化「最近一次过
 check_engine 的码」，挂到 candidate.gate 的只有外层 loop 跑的 full gate（权威，不变量 #5）。
 无权重无法自检时优雅降级为「静态过即出候选」。
 
@@ -102,16 +102,16 @@ _FENCE = re.compile(r"```(?:python)?\s*\n(.*?)```", re.DOTALL)
 
 
 class LLMClient(Protocol):
-    """generate 需要的最小 LLM 接口；真实实现来自 llm/（TBD），测试期可 mock。
+    """generate 需要的最小 LLM 接口；真实实现来自 llm/，测试期可 mock。
 
-    ``available`` 为假或调用返回 None/抛错时，本模块走兜底（返回 None）。新 LLM 基建可
-    额外提供 ``run_agent(prompt, tools=...)``；本模块会优先使用它，但仍兼容旧的
-    ``generate(prompt)`` mock。
+    ``available`` 为假或 ``run_agent`` 返回 ok=False/抛错时，本模块走兜底（返回 None）。
     """
 
     available: bool
 
-    def generate(self, prompt: str) -> str | None: ...
+    def run_agent(
+        self, prompt: str, tools: list[Any] | None = ..., **kwargs: Any
+    ) -> Any: ...
 
 
 # === 公共入口 =========================================================
@@ -167,34 +167,30 @@ def _generate(
     errors: list[ValidationError] | None,
     max_self_check_rounds: int = _MAX_SELF_CHECK_ROUNDS,
 ) -> Candidate | None:
-    """产一份候选：有 run_agent 的 client 走 agent 工具自检自闭环，否则退化为一次性出码 + 复核。
+    """产一份候选：把 check_engine 工具交给模型，让它边写边自检自闭环。
 
     agent 路径：把 check_engine 工具交给模型，让它写完整 engine.py → 自检 → 按 errors 修自己的码 →
     重调，直到过门（run_agent 内部 tool-loop，上限 max_self_check_rounds）。只持久化「最近一次过
     check_engine 的码」；模型从没成功调用工具时回退抽取最终文本并确定性复核。
-    legacy 路径：一次性 ``generate(prompt)`` → 抽码 → 静态 + quick 复核 → 过才出候选。
 
     **永不抛**（不变量 #3/#5）：build_prompt / run_agent / 暂存写盘 / quick_gate / 落盘 任一异常都
     收敛为「这轮无收益」（None），绝不漏给 loop。仅当过 quick（或无权重无法自检）才出候选。
     """
     if llm is None or not getattr(llm, "available", False):
         return None
+    if not callable(getattr(llm, "run_agent", None)):
+        return None  # 唯一支持的路径是 agent 工具自检自闭环；无 run_agent 视作不可用。
 
     prompt_mode: PromptMode = "repair" if mode == "repair" else "propose"
     try:
-        runner = getattr(llm, "run_agent", None)
-        if callable(runner):
-            return _generate_agent_loop(
-                ctx,
-                policy,
-                parent_code,
-                mode=prompt_mode,
-                llm=llm,
-                errors=errors,
-                max_self_check_rounds=max_self_check_rounds,
-            )
-        return _generate_legacy(
-            ctx, policy, parent_code, mode=prompt_mode, llm=llm, errors=errors
+        return _generate_agent_loop(
+            ctx,
+            policy,
+            parent_code,
+            mode=prompt_mode,
+            llm=llm,
+            errors=errors,
+            max_self_check_rounds=max_self_check_rounds,
         )
     except Exception:
         # build_prompt / run_agent / 暂存 / 落盘 等任何意外 → 无收益，不漏给 loop（never-throw）。
@@ -229,27 +225,6 @@ def _generate_agent_loop(
     # 回退：模型没成功调用工具（或末次没过）→ 抽最终文本，确定性复核后才出候选。
     # 绝不持久化未经 gate 的码。
     text = getattr(result, "text", None) if getattr(result, "ok", False) else None
-    code = _extract_code(text) if text else None
-    if code is None or check_self_contained(code):
-        return None
-    gate = _quick_self_check(ctx, code)
-    if gate is None or gate.passed:
-        return _persist(ctx, policy, code)
-    return None
-
-
-def _generate_legacy(
-    ctx: TaskContext,
-    policy: Policy,
-    parent_code: str,
-    *,
-    mode: PromptMode,
-    llm: LLMClient,
-    errors: list[ValidationError] | None,
-) -> Candidate | None:
-    """仅有 ``generate(prompt)`` 的 client：一次性出码 + 静态/quick 复核（无内层循环）。"""
-    prompt = build_prompt(policy, ctx, mode=mode, parent_code=parent_code, errors=errors)
-    text = llm.generate(prompt)
     code = _extract_code(text) if text else None
     if code is None or check_self_contained(code):
         return None

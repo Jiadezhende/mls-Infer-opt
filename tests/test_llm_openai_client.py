@@ -23,7 +23,8 @@ class FakeOpenAI:
 def test_client_is_unavailable_without_key_and_sdk():
     client = OpenAIAgentClient(LLMConfig(api_key=None))
     assert not client.available
-    assert client.generate("hello") is None
+    result = client.run_agent("hello")
+    assert result.ok is False
     assert client.unavailable_reason == "missing OPENAI_API_KEY"
 
 

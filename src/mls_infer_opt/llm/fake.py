@@ -12,15 +12,11 @@ __all__ = ["FakeAgentClient"]
 
 @dataclass
 class FakeAgentClient:
-    """Small fake that supports both generate() and run_agent()."""
+    """Small fake exposing the run_agent() entry that generate/analyze drive."""
 
     responses: list[str | AgentResult | Exception]
     available: bool = True
     prompts: list[str] = field(default_factory=list)
-
-    def generate(self, prompt: str) -> str | None:
-        result = self.run_agent(prompt)
-        return result.text if result.ok else None
 
     def run_agent(
         self,
