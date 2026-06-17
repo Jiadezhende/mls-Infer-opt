@@ -104,6 +104,11 @@ class TaskContext:
         return f"{self.paths.runs_dir}/{self.run_id}"
 
     @property
+    def run_final_dir(self) -> str:
+        """本次 run 的最终产物留档目录 = run_dir/final（审计快照 + results.log）。"""
+        return f"{self.run_dir}/final"
+
+    @property
     def engine_publish_path(self) -> str:
         """唯一发布出口，固定约定；只由 loop finalize 写。"""
         return f"{self.paths.output_dir}/engine.py"

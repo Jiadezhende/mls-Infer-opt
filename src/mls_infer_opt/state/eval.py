@@ -18,6 +18,7 @@ __all__ = [
     "GateResult",
     "BenchResult",
     "geomean_score",
+    "normalized_speedup_score",
 ]
 
 # 放本模块（零 torch）以便 worker(bench) 与父进程(trainer) 共用同一份公式，不把 torch 拖进父进程。
@@ -29,7 +30,7 @@ def geomean_score(*ratios: float) -> float:
 
     口径对齐真实 grader：它逐 case 报「整体 tokens/s」与「decode tokens/s」两列、外加显存，**不公布
     任何合成权重**。故这里不再内置 decode/mixed/prefill 权重，改由调用方把每个被计量的比值（各 case
-    的 overall-tps ratio + decode-tps ratio，见 trainer._normalize_score）平铺进来，等权合成——
+    的 overall-tps ratio + decode-tps ratio，见 normalized_speedup_score）平铺进来，等权合成——
     overall:decode 的相对话语权由「平铺了几项」自然决定，而非我们拍的常数。
 
     父进程传"对 baseline 的 ratio"（baseline 自身→各 1.0→score 1.0）；worker 临时自评传原始 tps
@@ -118,3 +119,35 @@ class BenchResult:
     duration_s: float = 0.0
     warnings: list[str] = field(default_factory=list)
     extra: dict[str, Any] = field(default_factory=dict)
+
+
+def normalized_speedup_score(bench: BenchResult, ref_bench: BenchResult) -> float:
+    """把 bench 的各计量列 tps 对 ref（baseline）求比值，平铺进等权几何平均加速比。
+
+    口径对齐真实 grader：它逐 case 报「整体 tokens/s」与「decode tokens/s」两列、不公布合成权重。
+    这里就把 grader 会量的每一列对 baseline 求比值、平铺进等权几何平均：
+      · prefill case：整体 tps（无 decode 列）
+      · decode  case：整体 tps + decode 列
+      · mixed   case：整体 tps + decode 列
+    overall:decode 的相对话语权由「平铺了几项」自然给出（overall 3 项 / decode 2 项），不再拍
+    0.60/0.25/0.15 这种合成权重。peak_memory 不入分（grader 虽报，合成口径未知，先作护栏）。
+
+    参照系 = bootstrap baseline 的 per-列 tps（自校准到真实评测硬件）：baseline 自身 ref 即自身
+    → 各 ratio 1.0 → score 1.0；后续候选 score≈×baseline，让 keep-best 严格比较与 speedup 展示
+    都有诚实语义。是 score 在所有消费者（keep_best / fmt_score_line / analyze）之前的唯一咽喉口径。
+    """
+
+    def _ratio(cand_tps: float, ref_tps: float) -> float:
+        # baseline 该列无数据（case 失败/0，如纯 prefill 的 decode 列）→ ratio 中性 1.0，
+        # 不让它把整体几何平均拖塌；候选在有 baseline 信号的列丢分则照实惩罚。
+        if ref_tps <= _SCORE_EPS:
+            return 1.0
+        return cand_tps / ref_tps
+
+    return geomean_score(
+        _ratio(bench.prefill_tps, ref_bench.prefill_tps),            # prefill 整体
+        _ratio(bench.decode_overall_tps, ref_bench.decode_overall_tps),  # decode 整体
+        _ratio(bench.decode_tps, ref_bench.decode_tps),             # decode 列
+        _ratio(bench.mixed_tps, ref_bench.mixed_tps),               # mixed 整体
+        _ratio(bench.mixed_decode_tps, ref_bench.mixed_decode_tps),  # mixed decode 列
+    )

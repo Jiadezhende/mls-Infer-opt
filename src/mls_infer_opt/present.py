@@ -8,9 +8,11 @@ score 口径见 evaluate/bench.py（越大越好）；speedup = score / baseline
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import sys
+from pathlib import Path
 from typing import Any
 
 __all__ = [
@@ -25,6 +27,11 @@ __all__ = [
     "fmt_banner",
     "result_verdict",
     "fmt_acceptance",
+    "summary",
+    "reasoning_trace",
+    "render_events",
+    "json_dump",
+    "stream_event",
 ]
 
 _W = 60  # banner / 验收块横线宽度
@@ -292,3 +299,157 @@ def fmt_acceptance(state: Any) -> str:
         return "\n".join(lines)
     except Exception:  # noqa: BLE001
         return ""
+
+
+# === 运行结果摘要 / 逐轮叙事 / 序列化（state → dict|text，loop 负责何时何处落盘） ===
+def summary(state: Any) -> dict[str, Any]:
+    """把 LoopState 摊成机读摘要 dict，嵌进 output3.json / runs/report.json。
+
+    含 result 判定、speedup、best 分项与逐轮推理叙事（rounds[]）。纯派生、不落盘——
+    何时/写到哪里由 loop（_publish_summary / _write_artifacts）决定。
+    """
+    best = state.best_candidate()
+    gate = best.gate if best is not None else None
+    gate_fail_stage = ""
+    if gate is not None and not gate.passed and gate.errors:
+        gate_fail_stage = gate.errors[0].stage
+    rounds = reasoning_trace(state)
+    # round 取「已执行轮数（含候选的 trace 条目）」与 state.round 的较大者：让中途快照不再比实际少
+    # 一拍（state.round 在 _run_policy_round 返回后才 +1，而落盘发生在其内部）。
+    executed_rounds = sum(1 for r in rounds if r.get("candidate_id"))
+    final_dir = Path(state.task_context.run_final_dir)
+    return {
+        "run_id": state.task_context.run_id,
+        "stop_reason": state.stop_reason,
+        "best_id": state.best_id,
+        "best_score": state.best_score if math.isfinite(state.best_score) else None,
+        "best_strategy_tags": list(best.strategy_tags) if best is not None else [],
+        "n_candidates": len(state.candidates),
+        "round": max(state.round, executed_rounds),
+        "stale_rounds": state.stale_rounds,
+        "elapsed_s": state.budget.elapsed_s,
+        "eval_runs": state.budget.eval_runs,
+        "engine_path": state.task_context.engine_publish_path if best is not None else "",
+        "archived_engine_path": str(final_dir / "engine.py") if best is not None else "",
+        "run_final_dir": str(final_dir),
+        # —— 让验收者一眼读懂「比 baseline 快多少 / 正确性」的增量字段 ——
+        "result": result_verdict(state),
+        "baseline_score": state.baseline_score if math.isfinite(state.baseline_score) else None,
+        "speedup": speedup(state.best_score, state.baseline_score),
+        "score_breakdown": score_breakdown(best.bench) if best is not None else {},
+        "correctness_passed": bool(gate and gate.passed),
+        "gate_stage_on_fail": gate_fail_stage,
+        # —— 逐轮推理叙事（诊断→策略→评测→结论），让 output3.* 自带推理而非只摘要 ——
+        "rounds": rounds,
+    }
+
+
+def reasoning_trace(state: Any) -> list[dict[str, Any]]:
+    """逐轮推理的紧凑机读数组，嵌进 output3.json / runs/report.json。
+
+    以每条 analyze 事件为一轮的锚：取诊断（bottleneck）/方向（strategy_tags/knobs_delta）/理由
+    （rationale=event.data["detail"]）/判定（continue|stop），再并入该 analyze 之后、下一条 analyze
+    之前最后一次 evaluate 的 {candidate_id, passed, score} 作结论，并由 candidate_id 反查候选补上
+    分项 score_breakdown（哪个轴动了）、parent_id（从谁 fork——留痕贪心爬山）、delta（相对上一轮的
+    分数增量）。never-throw → []。
+    """
+    try:
+        trace: list[dict[str, Any]] = []
+        cur: dict[str, Any] | None = None
+        prev_score: float | None = None
+        for ev in state.events:
+            data = ev.data or {}
+            if ev.source == "analyze":
+                cur = {
+                    "step": len(trace) + 1,
+                    "decision": data.get("decision"),
+                    "bottleneck": data.get("bottleneck") or "",
+                    "rationale": data.get("detail") or "",
+                    "strategy_tags": list(data.get("next_strategy_tags") or []),
+                    "knobs_delta": dict(data.get("knobs_delta") or {}),
+                    "used_llm": bool(data.get("used_llm", False)),
+                }
+                if data.get("stop_reason"):
+                    cur["stop_reason"] = data["stop_reason"]
+                trace.append(cur)
+            elif ev.source == "loop" and ev.phase == "evaluate" and cur is not None:
+                # 该轮 analyze 之后的评测结论：覆盖式取最后一次（含 repair 后的最终评测）。
+                cur["candidate_id"] = ev.candidate_id
+                cur["passed"] = bool(data.get("passed", False))
+                score = data.get("score")
+                if score is not None:
+                    cur["score"] = score
+                    cur["delta"] = (score - prev_score) if prev_score is not None else None
+                    prev_score = score
+                # 由 candidate_id 反查候选：补分项（哪个轴动了）+ 血缘（从谁 fork）。
+                cand = state.candidates.get(ev.candidate_id) if ev.candidate_id else None
+                if cand is not None:
+                    if cand.bench is not None:
+                        cur["score_breakdown"] = score_breakdown(cand.bench)
+                    cur["parent_id"] = cand.parent_id
+        return trace
+    except Exception:  # noqa: BLE001 — 叙事采集绝不拖垮 finalize 落盘
+        return []
+
+
+def render_events(state: Any) -> str:
+    """results.log 全量渲染（finalize 用）。与增量 append 走同一 render_event，格式一致。"""
+    if not state.events:
+        return ""
+    return "\n".join(render_event(e) for e in state.events) + "\n"
+
+
+def json_dump(payload: Any) -> str:
+    """稳定 JSON 序列化：非有限 float → null，tuple → list，键序固定。"""
+    return json.dumps(_json_safe(payload), ensure_ascii=False, indent=2, sort_keys=True)
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, tuple):
+        return [_json_safe(v) for v in value]
+    return value
+
+
+# 无 score_line 的事件，仍按这几个高频键点出指标；其余完整落 results.log（runs/final 留档）。
+_STREAM_KEYS = ("passed", "stop_reason", "attempt", "published")
+
+
+def stream_event(event: Any) -> None:
+    """事件观察者：把单条 AgentEvent 实时写 stderr，给评测终端逐轮反馈。
+
+    由 ``run_loop`` 通过 ``state.on_event`` 装到 state 上，于是 loop / analyze 等**所有**来源的
+    事件一产生就出现在终端，而不必等 finalize 落 results.log。格式化失败被 emit 吞掉，绝不影响主
+    流程（事件本身早已入表）。
+
+    extra 的取舍：评测/keep_best 事件优先显示带单位 + ×baseline 的 ``score_line``（取代裸 score）；
+    analyze 事件追加 bottleneck + strategy，让诊断行自解释。于是 analyze→generate→evaluate→
+    keep_best 四行天然连成「诊断→策略→评测→结论」叙事。
+    """
+
+    data = event.data
+    rnd = data.get("round")
+    prefix = f"[r{rnd}]" if rnd is not None else "[--]"
+    cid = f" {event.candidate_id}" if event.candidate_id else ""
+
+    extra = ""
+    if data.get("score_line"):
+        extra = f"  {data['score_line']}"
+    elif event.source == "analyze":
+        bits = []
+        if data.get("bottleneck"):
+            bits.append(f"bottleneck={data['bottleneck']}")
+        if data.get("next_strategy_tags"):
+            bits.append("strategy=" + ", ".join(str(t) for t in data["next_strategy_tags"]))
+        extra = f"  ({'; '.join(bits)})" if bits else ""
+    else:
+        bits = [f"{k}={data[k]}" for k in _STREAM_KEYS if data.get(k) is not None]
+        extra = f"  ({', '.join(bits)})" if bits else ""
+
+    where = f"{event.source}.{event.phase}"
+    emit(f"{prefix} {event.level:<7} {where}:{cid} {event.message}{extra}")

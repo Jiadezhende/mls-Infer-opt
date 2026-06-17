@@ -13,7 +13,6 @@ generate / evaluate / analyze 接起来，维护唯一的 ``LoopState``，并在
 from __future__ import annotations
 
 import json
-import math
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -29,7 +28,7 @@ from ..generate import repair as default_repair
 from ..state.candidate import Candidate, candidate_engine_path
 from ..state.common import utcnow_iso
 from ..state.context import Environment, Limits, Paths, TaskContext
-from ..state.eval import EvalMode, ValidationError, geomean_score
+from ..state.eval import EvalMode, ValidationError, normalized_speedup_score
 from ..state.loop import AgentEvent, EventLevel, LoopState
 from ..state.policy import Policy
 
@@ -466,20 +465,12 @@ def _register_candidate(state: LoopState, candidate: Candidate) -> Candidate:
 
 
 def _normalize_score(state: LoopState, candidate: Candidate) -> None:
-    """把候选 bench.score 归一化为"对 baseline 各计量列 tps 的等权几何平均加速比"。
+    """用 baseline 的 per-列 tps 作参照，把候选 bench.score 归一化为加速比（口径见 state.eval）。
 
-    口径对齐真实 grader：它逐 case 报「整体 tokens/s」与「decode tokens/s」两列、不公布合成权重。
-    这里就把 grader 会量的每一列对 baseline 求比值、平铺进等权几何平均：
-      · prefill case：整体 tps（无 decode 列）
-      · decode  case：整体 tps + decode 列
-      · mixed   case：整体 tps + decode 列
-    overall:decode 的相对话语权由「平铺了几项」自然给出（overall 3 项 / decode 2 项），不再拍
-    0.60/0.25/0.15 这种我们自己的权重。peak_memory 不入分（grader 虽报，合成口径未知，先作护栏）。
-
-    参照系 = bootstrap baseline 的 per-列 tps（自校准到真实评测硬件）。baseline 自身 ref 即自身
-    → 各 ratio 1.0 → score 1.0；后续候选 score≈×baseline，让 keep-best 严格比较与 speedup 展示
-    都有诚实语义。无 baseline（bootstrap 评测当下尚未冻结）或缺 bench 时安全跳过，保留 worker
-    临时自评。归一化在所有 score 消费者（keep_best / fmt_score_line / analyze）之前的唯一咽喉点。
+    参照系 = bootstrap baseline 候选的 bench（自校准到真实评测硬件）：baseline 自身 → score 1.0；
+    后续候选 score≈×baseline，让 keep-best 严格比较与 speedup 展示都有诚实语义。无 baseline
+    （bootstrap 评测当下尚未冻结）或缺 bench 时安全跳过，保留 worker 临时自评。是所有 score 消费者
+    （keep_best / fmt_score_line / analyze）之前的唯一咽喉点。
     """
     bench = candidate.bench
     if bench is None:
@@ -488,22 +479,7 @@ def _normalize_score(state: LoopState, candidate: Candidate) -> None:
     ref_bench = ref.bench if ref is not None else None
     if ref_bench is None:
         return
-
-    def _ratio(cand_tps: float, ref_tps: float) -> float:
-        # baseline 该列无数据（case 失败/0，如纯 prefill 的 decode 列）→ ratio 中性 1.0，
-        # 不让它把整体几何平均拖塌；候选在有 baseline 信号的列丢分则照实惩罚。
-        if ref_tps <= 1e-9:
-            return 1.0
-        return cand_tps / ref_tps
-
-    ratios = (
-        _ratio(bench.prefill_tps, ref_bench.prefill_tps),            # prefill 整体
-        _ratio(bench.decode_overall_tps, ref_bench.decode_overall_tps),  # decode 整体
-        _ratio(bench.decode_tps, ref_bench.decode_tps),             # decode 列
-        _ratio(bench.mixed_tps, ref_bench.mixed_tps),               # mixed 整体
-        _ratio(bench.mixed_decode_tps, ref_bench.mixed_decode_tps),  # mixed decode 列
-    )
-    bench.score = geomean_score(*ratios)
+    bench.score = normalized_speedup_score(bench, ref_bench)
     bench.loss = -bench.score
 
 
@@ -611,7 +587,7 @@ def _ensure_dirs(ctx: TaskContext) -> None:
 
 def _final_dir(ctx: TaskContext) -> Path:
     """本次 run 的最终产物留档目录。workspace 对外发布，runs/final 供审计复盘。"""
-    return Path(ctx.run_dir) / "final"
+    return Path(ctx.run_final_dir)
 
 
 def _copy_engine(src: str, dst: str) -> bool:
@@ -621,92 +597,6 @@ def _copy_engine(src: str, dst: str) -> bool:
     except OSError:
         return False
     return True
-
-
-def _summary(state: LoopState) -> dict[str, Any]:
-    best = state.best_candidate()
-    gate = best.gate if best is not None else None
-    gate_fail_stage = ""
-    if gate is not None and not gate.passed and gate.errors:
-        gate_fail_stage = gate.errors[0].stage
-    rounds = _reasoning_trace(state)
-    # round 取「已执行轮数（含候选的 trace 条目）」与 state.round 的较大者：让 _publish_summary 的
-    # 中途快照不再比实际少一拍（state.round 在 _run_policy_round 返回后才 +1，而落盘发生在其内部）。
-    executed_rounds = sum(1 for r in rounds if r.get("candidate_id"))
-    return {
-        "run_id": state.task_context.run_id,
-        "stop_reason": state.stop_reason,
-        "best_id": state.best_id,
-        "best_score": state.best_score if math.isfinite(state.best_score) else None,
-        "best_strategy_tags": list(best.strategy_tags) if best is not None else [],
-        "n_candidates": len(state.candidates),
-        "round": max(state.round, executed_rounds),
-        "stale_rounds": state.stale_rounds,
-        "elapsed_s": state.budget.elapsed_s,
-        "eval_runs": state.budget.eval_runs,
-        "engine_path": state.task_context.engine_publish_path if best is not None else "",
-        "archived_engine_path": str(_final_dir(state.task_context) / "engine.py")
-        if best is not None
-        else "",
-        "run_final_dir": str(_final_dir(state.task_context)),
-        # —— 让验收者一眼读懂「比 baseline 快多少 / 正确性」的增量字段 ——
-        "result": present.result_verdict(state),
-        "baseline_score": state.baseline_score if math.isfinite(state.baseline_score) else None,
-        "speedup": present.speedup(state.best_score, state.baseline_score),
-        "score_breakdown": present.score_breakdown(best.bench) if best is not None else {},
-        "correctness_passed": bool(gate and gate.passed),
-        "gate_stage_on_fail": gate_fail_stage,
-        # —— 逐轮推理叙事（诊断→策略→评测→结论），让 output3.* 自带推理而非只摘要 ——
-        "rounds": rounds,
-    }
-
-
-def _reasoning_trace(state: LoopState) -> list[dict[str, Any]]:
-    """逐轮推理的紧凑机读数组，嵌进 output3.json / runs/report.json。
-
-    以每条 analyze 事件为一轮的锚：取诊断（bottleneck）/方向（strategy_tags/knobs_delta）/理由
-    （rationale=event.data["detail"]）/判定（continue|stop），再并入该 analyze 之后、下一条 analyze
-    之前最后一次 evaluate 的 {candidate_id, passed, score} 作结论，并由 candidate_id 反查候选补上
-    分项 score_breakdown（哪个轴动了）、parent_id（从谁 fork——留痕贪心爬山）、delta（相对上一轮的
-    分数增量）。never-throw → []。
-    """
-    try:
-        trace: list[dict[str, Any]] = []
-        cur: dict[str, Any] | None = None
-        prev_score: float | None = None
-        for ev in state.events:
-            data = ev.data or {}
-            if ev.source == "analyze":
-                cur = {
-                    "step": len(trace) + 1,
-                    "decision": data.get("decision"),
-                    "bottleneck": data.get("bottleneck") or "",
-                    "rationale": data.get("detail") or "",
-                    "strategy_tags": list(data.get("next_strategy_tags") or []),
-                    "knobs_delta": dict(data.get("knobs_delta") or {}),
-                    "used_llm": bool(data.get("used_llm", False)),
-                }
-                if data.get("stop_reason"):
-                    cur["stop_reason"] = data["stop_reason"]
-                trace.append(cur)
-            elif ev.source == "loop" and ev.phase == "evaluate" and cur is not None:
-                # 该轮 analyze 之后的评测结论：覆盖式取最后一次（含 repair 后的最终评测）。
-                cur["candidate_id"] = ev.candidate_id
-                cur["passed"] = bool(data.get("passed", False))
-                score = data.get("score")
-                if score is not None:
-                    cur["score"] = score
-                    cur["delta"] = (score - prev_score) if prev_score is not None else None
-                    prev_score = score
-                # 由 candidate_id 反查候选：补分项（哪个轴动了）+ 血缘（从谁 fork）。
-                cand = state.candidates.get(ev.candidate_id) if ev.candidate_id else None
-                if cand is not None:
-                    if cand.bench is not None:
-                        cur["score_breakdown"] = present.score_breakdown(cand.bench)
-                    cur["parent_id"] = cand.parent_id
-        return trace
-    except Exception:  # noqa: BLE001 — 叙事采集绝不拖垮 finalize 落盘
-        return []
 
 
 def _install_observer(state: LoopState) -> None:
@@ -725,7 +615,7 @@ def _install_observer(state: LoopState) -> None:
         log_path = None
 
     def _sink(event: AgentEvent) -> None:
-        stream_event(event)
+        present.stream_event(event)
         if log_path is not None:
             present.append_event(log_path, event)
 
@@ -741,7 +631,9 @@ def _publish_summary(state: LoopState) -> None:
     try:
         out = Path(state.task_context.paths.output_dir)
         out.mkdir(parents=True, exist_ok=True)
-        (out / "output3.json").write_text(_json_dump(_summary(state)), encoding="utf-8")
+        (out / "output3.json").write_text(
+            present.json_dump(present.summary(state)), encoding="utf-8"
+        )
     except OSError:
         pass
 
@@ -758,40 +650,17 @@ def _write_artifacts(state: LoopState, *, enabled: bool) -> None:
     workspace = Path(ctx.paths.output_dir)
     archive = _final_dir(ctx)
     try:
-        summary_json = _json_dump(_summary(state))
+        summary_json = present.json_dump(present.summary(state))
         # workspace 对外只交付 engine.py + output3.json；runs/final 同步留一份作审计复盘。
         for out_dir in (workspace, archive):
             out_dir.mkdir(parents=True, exist_ok=True)
             (out_dir / "output3.json").write_text(summary_json, encoding="utf-8")
         # results.log 是逐轮事件日志：只留 runs/{run_id}/final，不进对外 workspace。
-        (archive / "results.log").write_text(_render_events(state), encoding="utf-8")
+        (archive / "results.log").write_text(present.render_events(state), encoding="utf-8")
         # 运行结束的任务结果记录，落本次 run 的独立目录根（runs/{run_id}）。
         (Path(ctx.run_dir) / "report.json").write_text(summary_json, encoding="utf-8")
     except OSError as e:
         _emit(state, f"artifact 写入失败：{e}", "finalize", level="error")
-
-
-def _json_dump(payload: Any) -> str:
-    return json.dumps(_json_safe(payload), ensure_ascii=False, indent=2, sort_keys=True)
-
-
-def _json_safe(value: Any) -> Any:
-    if isinstance(value, float):
-        return value if math.isfinite(value) else None
-    if isinstance(value, dict):
-        return {str(k): _json_safe(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_json_safe(v) for v in value]
-    if isinstance(value, tuple):
-        return [_json_safe(v) for v in value]
-    return value
-
-
-def _render_events(state: LoopState) -> str:
-    """results.log 全量渲染（finalize 用）。与增量 append 走同一 present.render_event，格式一致。"""
-    if not state.events:
-        return ""
-    return "\n".join(present.render_event(e) for e in state.events) + "\n"
 
 
 def _emit_llm_status(state: LoopState, llm: Any | None) -> None:
@@ -873,42 +742,3 @@ def _emit(
         data=payload,
     )
     state.add_event(event)
-
-
-# 无 score_line 的事件，仍按这几个高频键点出指标；其余完整落 results.log（runs/final 留档）。
-_STREAM_KEYS = ("passed", "stop_reason", "attempt", "published")
-
-
-def stream_event(event: AgentEvent) -> None:
-    """事件观察者：把单条 AgentEvent 实时写 stderr，给评测终端逐轮反馈。
-
-    由 ``run_loop`` 通过 ``state.on_event`` 装到 state 上，于是 loop / analyze 等**所有**来源的
-    事件一产生就出现在终端，而不必等 finalize 落 results.log。格式化失败被 present.emit 吞掉，
-    绝不影响主流程（事件本身早已入表）。
-
-    extra 的取舍：评测/keep_best 事件优先显示带单位 + ×baseline 的 ``score_line``（取代裸 score）；
-    analyze 事件追加 bottleneck + strategy，让诊断行自解释。于是 analyze→generate→evaluate→
-    keep_best 四行天然连成「诊断→策略→评测→结论」叙事。
-    """
-
-    data = event.data
-    rnd = data.get("round")
-    prefix = f"[r{rnd}]" if rnd is not None else "[--]"
-    cid = f" {event.candidate_id}" if event.candidate_id else ""
-
-    extra = ""
-    if data.get("score_line"):
-        extra = f"  {data['score_line']}"
-    elif event.source == "analyze":
-        bits = []
-        if data.get("bottleneck"):
-            bits.append(f"bottleneck={data['bottleneck']}")
-        if data.get("next_strategy_tags"):
-            bits.append("strategy=" + ", ".join(str(t) for t in data["next_strategy_tags"]))
-        extra = f"  ({'; '.join(bits)})" if bits else ""
-    else:
-        bits = [f"{k}={data[k]}" for k in _STREAM_KEYS if data.get(k) is not None]
-        extra = f"  ({', '.join(bits)})" if bits else ""
-
-    where = f"{event.source}.{event.phase}"
-    present.emit(f"{prefix} {event.level:<7} {where}:{cid} {event.message}{extra}")
