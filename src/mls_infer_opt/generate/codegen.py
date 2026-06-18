@@ -322,10 +322,22 @@ def _extract_code(text: str) -> str | None:
     return code or None
 
 
+def _next_seq(run_dir: str) -> int:
+    """本次 run 内下一个候选序号 = ``candidates/`` 下已有候选目录数。
+
+    loop 单写者顺序执行（一次只生成一个候选），无竞态；候选目录只增不删，故序号单调。
+    用文件系统而非 LoopState 计数，让 generate 保持与 LoopState 解耦（手上只有 ctx）。
+    """
+    base = Path(run_dir) / "candidates"
+    if not base.exists():
+        return 0
+    return sum(1 for p in base.iterdir() if p.is_dir())
+
+
 def _persist(ctx: TaskContext, policy: Policy, code: str) -> Candidate:
-    """落盘候选工作目录（engine.py + policy.json），算 id，返回 Candidate 元数据。"""
+    """落盘候选工作目录（engine.py + policy.json），分配序号 id，返回 Candidate 元数据。"""
     run_dir = ctx.run_dir
-    cid = make_candidate_id(policy.round, code)
+    cid = make_candidate_id(_next_seq(run_dir))
     engine_path = candidate_engine_path(run_dir, cid)
     os.makedirs(os.path.dirname(engine_path), exist_ok=True)
     Path(engine_path).write_text(code, encoding="utf-8")

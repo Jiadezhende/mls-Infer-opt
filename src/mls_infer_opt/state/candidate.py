@@ -12,7 +12,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -34,14 +33,14 @@ __all__ = [
 CandidateKind = Literal["baseline", "optimization", "repair"]
 
 
-def make_candidate_id(round_index: int, code: str) -> str:
-    """稳定可追踪的候选 id：``r{round}-{sha1(code)[:8]}``。
+def make_candidate_id(seq: int) -> str:
+    """候选 id：``c{seq}``，seq 是本次 run 内单调递增的候选序号。
 
-    决定性（只依赖 round + 代码内容），便于内容去重与审计；同一份代码在同一轮恒等同 id，
-    可 O(1) 判「这段代码是否已评测过」从而跳过重复评测。generate 在写盘前用它定 id。
+    只是一个稳定唯一的名字——落盘目录名 / 序列化 / 日志句柄 / report 引用，**不内容寻址、不承载
+    去重缓存语义**（同一候选不重复评测靠 candidate.gate 判空；参照缓存是 oracle 的事）。seq 由
+    generate 在写盘前从候选目录数得（见 generate.codegen._next_seq），state 层只格式化、不碰 IO。
     """
-    digest = hashlib.sha1(code.encode("utf-8")).hexdigest()[:8]
-    return f"r{round_index}-{digest}"
+    return f"c{seq}"
 
 
 def candidate_dir(run_dir: str, candidate_id: str) -> str:
@@ -67,7 +66,7 @@ class Candidate:
     评测结果 gate/bench 随生命周期后填，直接挂在本对象上（对象图，非外键）。
     """
 
-    id: str  # 内容指纹 + 落盘目录名 + 序列化/日志句柄（非主键——内存里直接持引用，不靠它 join）
+    id: str  # 运行内序号名 c{seq}：落盘目录名 + 日志句柄（非主键——内存直接持引用，不靠它 join）
     kind: CandidateKind
     round: int = 0
     parent_id: str | None = None  # 仅 kind=="baseline" 为 None，其余必填；字符串以便序列化

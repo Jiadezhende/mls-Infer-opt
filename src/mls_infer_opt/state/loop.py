@@ -60,9 +60,9 @@ class AgentEvent:
 class LoopState:
     """Orchestrator(loop) 持有的主状态——整个 run 唯一实例，贯穿全程。
 
-    candidates 是内容寻址的候选表（id = code 哈希，用于去重 / 落盘 / 序列化），gate/bench 直接挂在
-    各 Candidate 上，不另起并行表。不变量：best_id 一旦设置即指向一个 gate.passed 的候选，且永不
-    退化为更差或 None——用 set_best() 而非裸赋值来维持。
+    candidates 按运行内序号 id（c{seq}）索引——仅作落盘 / 序列化句柄，不内容寻址、不去重。
+    gate/bench 直接挂在各 Candidate 上，不另起并行表。不变量：best_id 一旦设置即指向一个
+    gate.passed 候选，且永不退化为更差或 None——用 set_best() 而非裸赋值来维持。
     """
 
     task_context: TaskContext = field(default_factory=TaskContext)

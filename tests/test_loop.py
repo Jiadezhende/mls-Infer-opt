@@ -43,7 +43,9 @@ def _persist_fake(
     passed: bool = True,
     score: float = 1.0,
 ) -> Candidate:
-    cid = make_candidate_id(policy.round, code)
+    base = Path(ctx.run_dir) / "candidates"
+    seq = sum(1 for p in base.iterdir() if p.is_dir()) if base.exists() else 0
+    cid = make_candidate_id(seq)
     engine_path = Path(candidate_engine_path(ctx.run_dir, cid))
     engine_path.parent.mkdir(parents=True, exist_ok=True)
     engine_path.write_text(code, encoding="utf-8")
@@ -225,7 +227,7 @@ def test_run_loop_promotes_strictly_better_candidate(tmp_path: Path):
     bd = r0["score_breakdown"]
     assert bd["decode_tps"] == 2.0 and bd["prefill_tps"] == 2.0 and bd["mixed_decode_tps"] == 2.0
     # 从 bootstrap baseline fork（贪心爬山留痕）。
-    assert r0["parent_id"] == make_candidate_id(0, "baseline engine")
+    assert r0["parent_id"] == make_candidate_id(0)
     assert r0["delta"] is None  # 首轮无前序，delta 为 None
     # round 与含候选的轮数自洽（≥ state.round），不再比实际少一拍。
     assert output["round"] == 1 and output["round"] >= state.round
@@ -290,7 +292,7 @@ def test_output3_records_non_improving_rounds_every_round(tmp_path: Path):
     assert output["round"] == len(executed) == state.round
     # 非提升轮也带分项 + 血缘 + 增量。
     assert executed[0]["score_breakdown"]["decode_tps"] == 0.5
-    assert executed[0]["parent_id"] == make_candidate_id(0, "baseline engine")
+    assert executed[0]["parent_id"] == make_candidate_id(0)
     assert executed[1]["delta"] == 0.0  # 两轮同分，增量 0
 
 

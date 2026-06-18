@@ -451,15 +451,7 @@ def _run_repairs(
 
 
 def _register_candidate(state: LoopState, candidate: Candidate) -> Candidate:
-    existing = state.candidates.get(candidate.id)
-    if existing is not None:
-        _emit(
-            state,
-            f"候选重复，复用已有结果：{candidate.id}",
-            "dedupe",
-            candidate_id=candidate.id,
-        )
-        return existing
+    # id 是运行内单调序号（c{seq}），同一 run 内不会重复——直接登记，无需去重。
     state.add_candidate(candidate)
     return candidate
 

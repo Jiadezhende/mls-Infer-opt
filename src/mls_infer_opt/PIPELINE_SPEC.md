@@ -148,6 +148,6 @@ C2 必须穿透。**
       - 前提：worker 要把候选自身异常 catch 成结构化 C1 裁决，只有真·进程级死亡才落 C2 分支。
 - [ ] **契约合一**：train 与 eval 各存一份"什么算合法候选" → 合成一份共享定义。
 - [ ] **emit 统一**：事件构造多份私有实现 + data 键名隐式契约 → 统一一个 emit + 一份事件契约。
-- [ ] **砍候选缓存 + id 简化**：跨候选内容去重基本不触发（且 id 含 round，跨轮去重构造上不可能）→
-      删去重分支；**id 从 `r{round}-{sha1(code)}` 简化成递增 seq**（如 `c{n}` 或 `r{round}-{n}`），
-      只作审计/落盘/引用，不再内容寻址。**保留**：同一候选评测幂等（gate 判空）、oracle 参照缓存。
+- [x] **砍候选缓存 + id 简化**（已实现，commit）：删 trainer 去重分支；id 从 `r{round}-{sha1(code)}`
+      改成运行内序号 `c{seq}`（seq = generate 数 `candidates/` 目录数，与 LoopState 解耦）；
+      state 层 `make_candidate_id(seq)` 保持纯函数。**保留**：同一候选评测幂等（gate 判空）、oracle 参照缓存。
