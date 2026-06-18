@@ -2,24 +2,53 @@
 
 analyze 的 LLM 用法刻意对齐 generate（见 [[agentic-generate]]）：**单次调用 + 确定性解析**，
 不依赖 function-calling / tool-loop。LLM 看「搜索空间菜单 + 当前 best + 历史/失败 + 预算」，
-回一个 ```json 决策块；解析失败就回 None，由 grad 退回 rule-based。
+回一个 ```json 决策块；解析失败就回 None，由 grad 重试一次、仍失败则 NoMove。
 
-本模块只拼字符串 / 抽 json；真正的 LLM 调用、判停执行、merge 出 Policy、发事件都在 grad.py。
+本模块只拼字符串 / 抽 json，并定义解析产物 ``Decision``（LLM 是 analyze 唯一方向源，
+``Decision`` 只由 ``parse_decision`` 产出）；真正的 LLM 调用、判停执行、merge 出 Policy、
+发事件都在 grad.py。
 """
 
 from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass, field
+from typing import Any, Literal
 
 from ..searchspace.policy import grouped_axes
 from ..searchspace.space import AXES, GROUP_ORDER
 from ..state.eval import BenchResult, ValidationError
 from ..state.policy import Policy
-from .heuristic import Action, Decision
 from .situation import Situation
 
-__all__ = ["ANALYZE_CONTRACT", "render_search_space", "build_analyze_prompt", "parse_decision"]
+__all__ = [
+    "Action",
+    "Decision",
+    "ANALYZE_CONTRACT",
+    "render_search_space",
+    "build_analyze_prompt",
+    "parse_decision",
+]
+
+Action = Literal["continue", "stop"]
+
+
+@dataclass
+class Decision:
+    """analyze 单轮决策（LLM 回复的解析产物）。grad 据此 merge 出 Policy 或判停。
+
+    ``action="continue"`` 时看 ``axes_delta``/``knobs_delta``/``rationale``/``bottleneck``；
+    ``action="stop"`` 时看 ``stop_reason``。两者都可带 ``bottleneck``（记进事件）。
+    """
+
+    action: Action = "continue"
+    axes_delta: dict[str, str] = field(default_factory=dict)
+    knobs_delta: dict[str, Any] = field(default_factory=dict)
+    rationale: str = ""
+    bottleneck: str = ""
+    stop_reason: str = ""
+
 
 _FENCE = re.compile(r"```(?:json)?\s*\n(.*?)```", re.DOTALL)
 
@@ -147,7 +176,7 @@ def build_analyze_prompt(sit: Situation, best_policy: Policy) -> str:
 
 
 def parse_decision(text: str | None) -> Decision | None:
-    """从 LLM 回复抽取 ```json 决策块并解析成 Decision；任何不合规都返回 None（退回 rule-based）。
+    """从 LLM 回复抽取 ```json 决策块并解析成 Decision；任何不合规都返回 None（交 grad 重试/判停）。
 
     防御式：先取围栏内 json，无围栏则整段试解析；字段缺省走 Decision 默认，类型不对则丢弃该字段。
     """

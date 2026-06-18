@@ -697,10 +697,11 @@ def _write_artifacts(state: LoopState, *, enabled: bool) -> None:
 
 
 def _emit_llm_status(state: LoopState, llm: Any | None) -> None:
-    """开局记录 LLM 可用性——不可用时把原因落进 results.log，杜绝降级被静默吞掉。
+    """开局记录 LLM 可用性——不可用时把原因落进 results.log，杜绝失败被静默吞掉。
 
-    这条事件回答「为什么整轮 used_llm 都是 False」：缺 key / 没装 SDK / disabled 等真因在
-    client 构造时已算进 ``unavailable_reason``，这里把它显式留痕，而非事后靠时序猜。
+    LLM 是 analyze 唯一方向源：不可用即首轮 NoMove、只发布 baseline。这条事件回答「为什么这条
+    run 没动起来」：缺 key / 没装 SDK / disabled 等真因在 client 构造时已算进
+    ``unavailable_reason``，这里把它显式留痕，而非事后靠时序猜。
     """
     fp = _llm_fingerprint(llm)
     available = bool(llm is not None and getattr(llm, "available", False))
@@ -716,7 +717,7 @@ def _emit_llm_status(state: LoopState, llm: Any | None) -> None:
     reason = reason or "llm client 未装配（None）"
     emit(
         state,
-        f"LLM 不可用，全程走规则兜底：{reason}"
+        f"LLM 不可用，analyze 将首轮 NoMove、只发布 baseline：{reason}"
         f"（key={fp['api_key']} base_url={fp['base_url']} model={fp['model']}）",
         "llm",
         level="warning",

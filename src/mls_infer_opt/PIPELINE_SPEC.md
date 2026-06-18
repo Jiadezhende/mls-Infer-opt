@@ -42,7 +42,8 @@
 唯一持有主状态、预算、控制流的组件。子职责：
 
 - **装配（init）**：确定性 run 身份；environment **一次探测、之后只读**；**LLM 模式一次性裁定**
-  （已配置 → 全程要求可用；未配置 → 全程显式 rule-based，运行中不再中途降级）；前置校验
+  （LLM 是 analyze 唯一方向源；已配置 → 全程要求可用，调用失败即 C2 报；未配置 / 不可用 →
+  analyze 首轮 `NoMove("llm_unavailable")`、只发布 baseline，不在装配期硬 abort）；前置校验
   （weights / model_config 在不在、合法不合法）。
 - **驱动循环**：预算记账；每轮按 求梯度 → 合成 → 验证 序列化调用；安全上限防空转。
 - **keep-best（checkpoint）**：单一选优逻辑、严格更优、过门只是入场券；提升即**增量发布**（抗 kill）；
@@ -62,7 +63,9 @@
   - 方向 = 从 best 出发的 axes / knobs delta。
   - `NoMove` = gradient ≈ 0（无产出方向），带 rationale 交总控，作为一个**终止输入值**（不是终止动作）。
   - 只读、无发布权、不改状态。
-- **失败语义**：建视图崩 = C4；**LLM 调用失败 = C2 报**；LLM 给了合法但平庸的答案 = 回规则阶梯（C1 邻域）。
+- **失败语义**：建视图崩 = C4；**LLM 调用失败 = C2 报**；LLM 不可用 = `NoMove("llm_unavailable")`；
+  LLM 内容失败（解析不出 / 方向非法，C1 邻域）= 重试一次仍败则 `NoMove("llm_content_failure")`。
+  LLM 是唯一方向源，无规则兜底。
 
 ### 行为阶段 ②：合成 / 训练一步（train）
 
@@ -121,10 +124,11 @@ C2 必须穿透。**
 - **LLM 调用失败直接报错**（C2），不静默降级、不伪装成"这轮没收益"。过去糊进 C1 的后果是
   run 被静默踢进规则模式，还得靠事后取指纹法医式复原"为什么没用 LLM"。C2 穿透后，那套指纹 /
   降级侦测机制大半可删。
-- **LLM 模式在装配阶段一次性裁定**（§1 总控）：配置了就必须能用、调用失败即报；没配置就整条 run
-  显式走规则。不存在运行中两种模式偷偷来回切。
-- **"LLM 给了合法但无用的答案"不是 C2**：那是内容质量问题（C1 邻域），可回规则阶梯——
-  与"调用本身失败"严格区分。
+- **LLM 模式在装配阶段一次性裁定**（§1 总控）：配置了就必须能用、调用失败即报；没配置 / 不可用，
+  analyze 首轮即 `NoMove("llm_unavailable")`、只发布 baseline。LLM 是 analyze 唯一方向源，无规则兜底，
+  不存在运行中两种模式偷偷来回切。
+- **"LLM 给了合法但无用的答案"不是 C2**：那是内容质量问题（C1 邻域），**重试一次**仍失败则
+  `NoMove("llm_content_failure")`——与"调用本身失败"（C2 穿透）严格区分。
 
 ---
 
@@ -144,8 +148,13 @@ C2 必须穿透。**
       `stop_reason="llm_infra_failure"` + 仍 finalize 发布 best-so-far（must-publish 不破）。
 - [x] **LLM 模式一次性裁定**（已实现）：`available` 在客户端构造时定一次、运行中不翻；唯一的中途降级
       （传输失败回退 rule-based）已被 C2 穿透取代。startup `_emit_llm_status` 响亮记一次裁定结果。
-      未配置 → 全程规则（heuristic + 仅 baseline）；配置且不可用 → 响亮警告后走规则（不硬 abort，
+      未配置 / 不可用 → analyze 首轮 `NoMove("llm_unavailable")`、只发布 baseline（不硬 abort，
       因 must-exit-0 + baseline 兜底优先）。无需每轮再探测。
+- [x] **删 rule-based 兜底，LLM 成 analyze 唯一方向源**（已实现）：删 `analyze/heuristic.py`
+      （`MOVES`/`heuristic_decision` 贪心阶梯）；`Decision`/`Action` 搬到 `analyze/prompt.py`（LLM 解析
+      产物）。analyze 不可用 → `NoMove("llm_unavailable")`；内容失败（`ok=False`/解析不出/方向非法，C1
+      邻域）**重试一次**仍败 → `NoMove("llm_content_failure")`；C2 仍穿透。与 generate（无 LLM → None、
+      无 rule-based codegen）对称。总控控制流不变（`NoMove` 已被接住停机）。
 - [x] **C1 / C2 分离 + 重试策略**（已实现，commit）：新增 `evaluate.EvaluatorInfraError`；run_job
       按"worker 是否产出结构化裁决"分流：
       - worker 产出裁决（pass/fail）→ 信它，fail = C1，拒候选、继续，**不重试**（eval 确定性）。

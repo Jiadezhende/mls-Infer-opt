@@ -2,7 +2,7 @@
 
 ``Situation`` 是 ephemeral 计算视图（类比 generate 的 ``AggregateResult``）：只在 analyze 内部
 传递、**绝不进 state / 不序列化**。它把诊断/判停/构 prompt 都要看的派生量算一遍，避免在
-heuristic 与 prompt 两处各自重算 LoopState。
+grad 与 prompt 两处各自重算 LoopState。
 
 纯逻辑、只读：所有数字都从 LoopState 对象图派生（best/candidates/budget/limits），不落盘、
 不改 state（见 [[contracts-are-object-graphs]] / [[analyze-record-via-events]]）。

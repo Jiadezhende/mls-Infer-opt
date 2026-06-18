@@ -40,7 +40,7 @@ loop     = trainer  驱动循环、keep-best、判停、发布
 | `loop/` | trainer | 建 `TaskContext`、驱动 bootstrap/每轮优化、keep-best、执行判停、finalize 发布与 artifacts。唯一发布出口。 |
 | `generate/` | train | 产候选：`bootstrap` 保守 baseline、`propose` 按 `Policy` 生成优化候选、`repair` 按错误修复候选。 |
 | `evaluate/` | eval | 权威 correctness gate + benchmark。只通过 gate 的候选才有 bench 和 score。 |
-| `analyze/` | grad | 汇总 `LoopState` 态势，硬判停或给出下一步 `Policy`。LLM 可选，失败退回 rule-based。 |
+| `analyze/` | grad | 汇总 `LoopState` 态势，给出下一步 `Policy` 或 `NoMove`（不判停）。LLM 是唯一方向源：不可用 → `NoMove("llm_unavailable")`；内容失败重试一次仍败 → `NoMove("llm_content_failure")`；C2 穿透。 |
 | `llm/` | 基建 | generate/analyze 共用的 LLM 客户端与 fake/test double。不可用时暴露 `available=False` 或返回空。 |
 | `state/` | 基建 | 共享数据契约：`TaskContext`、`LoopState`、`Candidate`、`Policy`、`GateResult`、`BenchResult`、事件流。 |
 
@@ -150,9 +150,8 @@ runs/{run_id}/candidates/{candidate_id}/policy.json
 ### analyze
 
 - `situation.py`：从 `LoopState` 汇总 ephemeral `Situation`。
-- `heuristic.py`：硬判停 + rule-based 贪心阶梯。
-- `prompt.py`：构造 LLM 诊断 prompt，并把 LLM JSON 回复解析成 `Decision`。
-- `grad.py`：主入口 `analyze(state, llm=None)`，返回下一个 `Policy` 或 `None`。
+- `prompt.py`：构造 LLM 诊断 prompt，把 LLM JSON 回复解析成 `Decision`，并定义 `Decision`/`Action` 类型。
+- `grad.py`：主入口 `analyze(state, llm=None)`，返回下一个 `Policy` 或 `NoMove`。LLM 是唯一方向源（不可用/内容失败 → `NoMove`，C2 穿透）。
 
 ### generate
 

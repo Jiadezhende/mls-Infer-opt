@@ -18,7 +18,7 @@ class LLMCallError(LLMError):
 
     run_agent 在真实调用抛错时抛出本异常，**不**静默降级成 ok=False——C2 必须穿透到总控的循环
     边界，由总控记 C2 + 仍发布 best-so-far（见 PIPELINE_SPEC §3）。内容层失败（模型没给最终答复 /
-    工具循环没收敛）仍是 ok=False，属 C1 邻域，调用方可回退 rule-based，不抛。
+    工具循环没收敛）仍是 ok=False，属 C1 邻域，调用方按 C1 处理（重试一次 / 当本轮无收益），不抛。
     """
 
 

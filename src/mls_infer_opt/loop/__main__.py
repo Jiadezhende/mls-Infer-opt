@@ -50,19 +50,20 @@ def _build_llm() -> object | None:
 
     返回不可用 client（其 ``available=False``）而非 None：consumers（analyze/generate）本就按
     ``.available`` 决策、行为不变，但 loop 能据此把 ``unavailable_reason`` 落进 results.log——
-    杜绝「缺 key / 没装 SDK」这类降级被静默吞掉、事后只能靠时序猜。仅装配阶段自身抛异常时返回 None。
+    杜绝「缺 key / 没装 SDK」这类失败被静默吞掉、事后只能靠时序猜。仅装配阶段自身抛异常时返回 None。
+    LLM 不可用时 analyze 首轮即 NoMove、只发布 baseline（不再有规则兜底）。
     """
 
     try:
         from ..llm import OpenAIAgentClient
 
         client = OpenAIAgentClient()
-    except Exception as e:  # noqa: BLE001 — LLM 是可选增益，绝不能让装配阶段拖垮进程
-        print(f"[loop.__main__] LLM 装配异常，退回规则兜底: {e}", file=sys.stderr)
+    except Exception as e:  # noqa: BLE001 — 装配阶段绝不能拖垮进程；不可用则只发布 baseline
+        print(f"[loop.__main__] LLM 装配异常，将只发布 baseline: {e}", file=sys.stderr)
         return None
     if not client.available:
         print(
-            f"[loop.__main__] LLM 不可用，退回规则兜底: {client.unavailable_reason}",
+            f"[loop.__main__] LLM 不可用，将只发布 baseline: {client.unavailable_reason}",
             file=sys.stderr,
         )
     return client

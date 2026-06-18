@@ -1,6 +1,8 @@
-"""analyze 测试：态势汇总 / 判停 / rule-based 阶梯 / 解析（纯逻辑）+ 编排兜底（fake LLM）。
+"""analyze 测试：态势汇总 / 解析（纯逻辑）+ 编排（fake LLM）。
 
-全部纯逻辑、不需 torch。LLM 路径用 llm.FakeAgentClient 驱动（对齐 test_generate.py 约定）。
+全部纯逻辑、不需 torch。LLM 是唯一方向源：不可用 → NoMove("llm_unavailable")；内容失败重试一次
+仍败 → NoMove("llm_content_failure")；C2 穿透。LLM 路径用 llm.FakeAgentClient 驱动
+（对齐 test_generate.py 约定）。
 """
 
 from __future__ import annotations
@@ -10,15 +12,13 @@ from pathlib import Path
 import pytest
 
 from mls_infer_opt.analyze import (
-    MOVES,
     analyze,
     build_analyze_prompt,
     build_situation,
-    heuristic_decision,
     parse_decision,
 )
 from mls_infer_opt.llm import FakeAgentClient, LLMCallError, LLMError
-from mls_infer_opt.searchspace.policy import aggregate, default_policy, to_json
+from mls_infer_opt.searchspace.policy import aggregate, to_json
 from mls_infer_opt.state.candidate import Candidate, candidate_policy_path
 from mls_infer_opt.state.context import Limits, Paths, TaskContext
 from mls_infer_opt.state.eval import BenchResult, GateResult, ValidationError
@@ -108,33 +108,7 @@ def test_build_situation_derives_best_and_failures(tmp_path):
 
 # === 2. 硬上限判停已上移总控（见 test_loop.test_hard_stop_*）；analyze 不再判停 ====
 
-# === 3. heuristic_decision（贪心阶梯，纯逻辑） =======================
-def test_heuristic_picks_kv_cache_first_from_baseline(tmp_path):
-    sit = build_situation(make_state(tmp_path))
-    decision = heuristic_decision(sit, default_policy())
-    assert decision.action == "continue"
-    assert decision.axes_delta == {"kv_cache": "incremental"}
-    assert "rule-based" in decision.rationale
-
-
-def test_heuristic_skips_already_applied_axis(tmp_path):
-    best = aggregate({"kv_cache": "incremental"}, kind="baseline").policy
-    sit = build_situation(make_state(tmp_path, best_axes={"kv_cache": "incremental"}))
-    decision = heuristic_decision(sit, best)
-    # kv_cache 已应用 → 跳到阶梯下一条 rope
-    assert decision.axes_delta == {"rope": "precomputed_table"}
-
-
-def test_heuristic_stops_when_ladder_exhausted(tmp_path):
-    all_moves = {m.axis: m.option for m in MOVES}
-    best = aggregate(all_moves, kind="baseline").policy
-    sit = build_situation(make_state(tmp_path, best_axes=all_moves))
-    decision = heuristic_decision(sit, best)
-    assert decision.action == "stop"
-    assert decision.stop_reason == "no_obvious_direction"
-
-
-# === 4. parse_decision（防御式，纯逻辑） ============================
+# === 3. parse_decision（防御式，纯逻辑） ============================
 def test_parse_decision_valid_json_block():
     text = _json_block(
         '{"action":"continue","axes_delta":{"kv_cache":"incremental"},'
@@ -198,54 +172,76 @@ def test_analyze_merges_delta_onto_best_policy(tmp_path):
     assert policy.axes["rope"] == "precomputed_table"  # delta 叠加
 
 
-def test_analyze_falls_back_to_heuristic_on_garbage(tmp_path):
+def test_analyze_content_failure_retries_once_then_nomove(tmp_path):
+    # C1 内容失败：解析不出 → 重试一次（共调 2 次）仍败 → NoMove("llm_content_failure")。
     state = make_state(tmp_path)
-    llm = FakeAgentClient(["completely unparseable response"])
-    policy = analyze(state, llm=llm)
-    assert policy is not None
-    assert policy.axes["kv_cache"] == "incremental"  # 阶梯首步
+    llm = FakeAgentClient(["garbage one", "garbage two"])
+    result = analyze(state, llm=llm)
+    assert isinstance(result, NoMove)
+    assert result.reason == "llm_content_failure"
+    assert len(llm.prompts) == 2  # 初试 + 重试一次
     events = _analyze_events(state)
-    assert len(events) == 1 and events[0].data["used_llm"] is False
+    assert len(events) == 1 and events[0].data["used_llm"] is True
+    assert events[0].data["stop_reason"] == "llm_content_failure"
 
 
-def test_analyze_falls_back_on_unexpected_non_llm_error(tmp_path):
-    # 非 LLMError 的意外异常（现实里 run_agent 会包成 LLMCallError；这里测防御回退）→ 回 heuristic。
+def test_analyze_retries_once_then_recovers(tmp_path):
+    # 第一次 garbage、第二次有效：重试救回，返回 Policy（验证确实再问一次且能恢复）。
     state = make_state(tmp_path)
-    llm = FakeAgentClient([RuntimeError("boom")])
+    llm = FakeAgentClient([
+        "unparseable",
+        _json_block('{"action":"continue","axes_delta":{"kv_cache":"incremental"},'
+                    '"rationale":"重试后给出方向"}'),
+    ])
     policy = analyze(state, llm=llm)
-    assert policy is not None and policy.axes["kv_cache"] == "incremental"
-    assert len(_analyze_events(state)) == 1
+    assert not isinstance(policy, NoMove)
+    assert policy.axes["kv_cache"] == "incremental"
+    assert len(llm.prompts) == 2
+
+
+def test_analyze_unexpected_non_llm_error_is_content_failure(tmp_path):
+    # 非 LLMError 的意外异常当内容失败：进重试，仍败 → NoMove("llm_content_failure")。
+    state = make_state(tmp_path)
+    llm = FakeAgentClient([RuntimeError("boom")])  # 第二次 responses 空 → ok=False
+    result = analyze(state, llm=llm)
+    assert isinstance(result, NoMove) and result.reason == "llm_content_failure"
+    assert len(llm.prompts) == 2
 
 
 def test_analyze_propagates_c2_llm_infra_error(tmp_path):
-    # C2 传输失败：analyze 不吞、穿透交总控（不再静默降级到 rule-based）。
+    # C2 传输失败：analyze 不吞、不重试、穿透交总控。
     state = make_state(tmp_path)
     llm = FakeAgentClient([LLMCallError("network down")])
     with pytest.raises(LLMError):
         analyze(state, llm=llm)
 
 
-def test_analyze_no_llm_uses_heuristic(tmp_path):
+def test_analyze_no_llm_returns_unavailable_nomove(tmp_path):
     state = make_state(tmp_path)
-    policy = analyze(state, llm=None)
-    assert policy is not None and policy.axes["kv_cache"] == "incremental"
-    assert len(_analyze_events(state)) == 1
+    result = analyze(state, llm=None)
+    assert isinstance(result, NoMove) and result.reason == "llm_unavailable"
+    events = _analyze_events(state)
+    assert len(events) == 1 and events[0].data["used_llm"] is False
 
 
-def test_analyze_unavailable_llm_uses_heuristic(tmp_path):
+def test_analyze_unavailable_llm_returns_unavailable_nomove(tmp_path):
     state = make_state(tmp_path)
     down = FakeAgentClient([], available=False)
-    policy = analyze(state, llm=down)
-    assert policy is not None and policy.axes["kv_cache"] == "incremental"
+    result = analyze(state, llm=down)
+    assert isinstance(result, NoMove) and result.reason == "llm_unavailable"
     assert not down.prompts  # 不可用 → 根本没问 LLM
 
 
 def test_analyze_ignores_hard_limits_now_in_loop(tmp_path):
     # 硬上限判停已上移总控：analyze 即便 stale 到上限也只算方向（不再判停），返回 Policy。
     state = make_state(tmp_path, stale_rounds=3, limits=Limits(max_stale_rounds=3))
-    result = analyze(state, llm=None)
+    llm = FakeAgentClient([
+        _json_block('{"action":"continue","axes_delta":{"kv_cache":"incremental"},'
+                    '"rationale":"仍给方向"}')
+    ])
+    result = analyze(state, llm=llm)
     assert not isinstance(result, NoMove)
-    assert result.axes["kv_cache"] == "incremental"  # 仍给阶梯首步方向
+    assert result.axes["kv_cache"] == "incremental"
 
 
 def test_analyze_llm_stop_decision_returns_nomove(tmp_path):
@@ -261,11 +257,16 @@ def test_analyze_llm_stop_decision_returns_nomove(tmp_path):
 
 
 def test_analyze_degrades_without_best_policy_file(tmp_path):
-    # policy.json 缺失 → _load_best_policy 走 strategy_tags 还原 → 仍能产 Policy。
+    # policy.json 缺失 → _load_best_policy 走 strategy_tags 还原 → 仍能在其上 merge delta。
     state = make_state(tmp_path, best_axes={"kv_cache": "incremental"}, write_policy=False)
-    policy = analyze(state, llm=None)
-    assert policy is not None
-    assert policy.axes["kv_cache"] == "incremental"  # 从 strategy_tags 还原
+    llm = FakeAgentClient([
+        _json_block('{"action":"continue","axes_delta":{"rope":"precomputed_table"},'
+                    '"rationale":"叠 RoPE delta"}')
+    ])
+    policy = analyze(state, llm=llm)
+    assert not isinstance(policy, NoMove)
+    assert policy.axes["kv_cache"] == "incremental"  # 从 strategy_tags 还原的 best
+    assert policy.axes["rope"] == "precomputed_table"  # delta 叠加成功
 
 
 # === 6. build_analyze_prompt（纯逻辑 smoke） =========================

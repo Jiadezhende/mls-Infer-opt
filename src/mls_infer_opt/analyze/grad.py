@@ -1,12 +1,17 @@
 """grad — analyze 的编排入口：汇总态势 → 给方向（或无方向）→ 产下一个 Policy，并每轮记一条事件。
 
-每轮循环的「大脑」=求梯度：只算「往哪走」。问 LLM 要方向（单次调用 + 确定性解析，见 prompt.py），
-LLM 不可用 / 失败 / 产垃圾就退回 rule-based 阶梯（heuristic.py）。
+每轮循环的「大脑」=求梯度：只算「往哪走」。**LLM 是唯一方向源**（单次调用 + 确定性解析，见
+prompt.py）：
+
+- LLM 不可用 / 未配置 → 首轮即 ``NoMove("llm_unavailable")``，交总控停、发布 baseline。
+- LLM 内容失败（``ok=False`` / 解析不出 / 方向非法，C1 邻域）→ **重试一次**，仍失败则
+  ``NoMove("llm_content_failure")``。
+- LLM 调用基建失败（``LLMError``，C2）→ 穿透交总控（不在此降级）。
 
 不变量纪律：
 - **只算方向、不判停**：analyze 返回 ``Policy``（迈出的一步）或 ``NoMove(reason)``（gradient≈0，
   迈不出）。**硬上限判停（预算 / 轮数 / 连续无提升）不在这里**——那是总控的循环准则（见 loop）。
-- **never-throw**：内部任何异常都翻成一条 error 事件 + 返回 ``NoMove("analyze_error")``。
+- **never-throw（除 C2）**：内部非 C2 异常都翻成一条 error 事件 + 返回 ``NoMove("analyze_error")``。
 - **无发布权 / 不写 stop_reason**：每轮 emit 一条 ``source="analyze"`` 事件作记录（见
   [[analyze-record-via-events]]）；是否因 NoMove 终止、停因落 ``LoopState.stop_reason``，由总控定。
 - 下一个 Policy 由 ``searchspace.policy.merge(best_policy, axes_delta=…, …, rationale=…)`` 构造，
@@ -23,8 +28,7 @@ from ..searchspace.policy import aggregate, default_policy, from_json, merge
 from ..state.candidate import candidate_policy_path
 from ..state.loop import LoopState, emit
 from ..state.policy import NoMove, Policy
-from .heuristic import Decision, heuristic_decision
-from .prompt import build_analyze_prompt, parse_decision
+from .prompt import Decision, build_analyze_prompt, parse_decision
 from .situation import Situation, build_situation
 
 __all__ = ["LLMClient", "analyze"]
@@ -33,7 +37,8 @@ __all__ = ["LLMClient", "analyze"]
 class LLMClient(Protocol):
     """analyze 需要的最小 LLM 接口；与 generate 一致，统一走 run_agent。
 
-    ``available`` 为假或调用抛错 / 返回空时，analyze 退回 rule-based（不抛异常）。
+    ``available`` 为假 → analyze 首轮 NoMove；调用抛 LLMError(C2) 穿透；返回空 / 解析不出（C1）
+    重试一次后 NoMove。
     """
 
     available: bool
@@ -46,7 +51,9 @@ class LLMClient(Protocol):
 def analyze(state: LoopState, *, llm: LLMClient | None = None) -> Policy | NoMove:
     """只算方向：产下一个 Policy，或 NoMove(reason)（迈不出步）。每轮 emit 一条 analyze 事件。
 
-    硬上限判停不在这里——是总控的循环准则。never-throw：内部异常 → 记错 + NoMove("analyze_error")。
+    LLM 是唯一方向源：不可用 → NoMove("llm_unavailable")；内容失败重试一次仍败 →
+    NoMove("llm_content_failure")；C2 穿透。硬上限判停不在这里——是总控的循环准则。
+    never-throw（除 C2）：内部异常 → 记错 + NoMove("analyze_error")。
     """
     try:
         sit = build_situation(state)
@@ -57,25 +64,32 @@ def analyze(state: LoopState, *, llm: LLMClient | None = None) -> Policy | NoMov
                    "decision": "stop", "stop_reason": "analyze_error"})
         return NoMove("analyze_error")
 
-    # 1. 方向：LLM 优先，rule-based 兜底。
     best_policy = _load_best_policy(state)
-    used_llm = False
-    decision: Decision | None = None
-    if llm is not None and getattr(llm, "available", False):
-        decision = _ask_llm(sit, best_policy, llm)
-        used_llm = decision is not None
-    if decision is None:
-        decision = heuristic_decision(sit, best_policy)
 
-    # 2. 无方向（LLM 判定到位 / 阶梯走完）→ NoMove，交总控裁决是否终止。
+    # 1. LLM 是唯一方向源：不可用即首轮无方向，交总控停、发布 baseline。
+    if llm is None or not getattr(llm, "available", False):
+        emit(state, source="analyze", phase="grad", message="无方向：LLM 不可用",
+             data={"detail": "LLM 未配置或不可用，无方向可算", "decision": "stop",
+                   "stop_reason": "llm_unavailable", "used_llm": False, **_situation_data(sit)})
+        return NoMove("llm_unavailable")
+
+    # 2. 问 LLM 要方向（内容失败重试一次；C2 穿透）。仍要不到 → 无方向。
+    decision = _ask_llm(sit, best_policy, llm)
+    if decision is None:
+        emit(state, source="analyze", phase="grad", message="无方向：LLM 内容失败",
+             data={"detail": "LLM 回复解析不出有效方向（重试一次后仍失败）", "decision": "stop",
+                   "stop_reason": "llm_content_failure", "used_llm": True, **_situation_data(sit)})
+        return NoMove("llm_content_failure")
+
+    # 3. 无方向（LLM 判定到位）→ NoMove，交总控裁决是否终止。
     if decision.action == "stop":
         reason = decision.stop_reason or "no_direction"
         emit(state, source="analyze", phase="grad", message=f"无方向：{reason}",
              data={"detail": decision.bottleneck, "decision": "stop", "stop_reason": reason,
-                   "used_llm": used_llm, **_situation_data(sit)})
+                   "used_llm": True, **_situation_data(sit)})
         return NoMove(reason)
 
-    # 3. 从 best 出发叠 delta → 合法的下一个 Policy。
+    # 4. 从 best 出发叠 delta → 合法的下一个 Policy。
     try:
         agg = merge(
             best_policy,
@@ -101,7 +115,7 @@ def analyze(state: LoopState, *, llm: LLMClient | None = None) -> Policy | NoMov
         data={
             "detail": decision.rationale,
             "decision": "continue",
-            "used_llm": used_llm,
+            "used_llm": True,
             "axes_delta": decision.axes_delta,
             "knobs_delta": decision.knobs_delta,
             "bottleneck": decision.bottleneck,
@@ -115,23 +129,28 @@ def analyze(state: LoopState, *, llm: LLMClient | None = None) -> Policy | NoMov
 
 # === 内部 =============================================================
 def _ask_llm(sit: Situation, best_policy: Policy, llm: LLMClient) -> Decision | None:
-    """问 LLM 要方向。C2（LLMError）穿透交总控；其它意外 → None（回 rule-based）。
+    """问 LLM 要方向，**内容失败重试一次**。要不到（仍 None）交 grad 判 NoMove。
 
-    内容层失败（run_agent ok=False / 解析不出 Decision）由 _call_llm/parse_decision 返回 None，
-    属 C1 邻域、回退规则；只有传输/基建失败（run_agent raise LLMCallError）才向上穿透。
+    内容层失败（run_agent ok=False / 解析不出 Decision，C1 邻域）→ 再问一次同样的 prompt；
+    传输/基建失败（run_agent raise LLMError，C2）→ 向上穿透，不重试、不降级。
+    其它非预期异常当作内容失败处理（进重试）。
     """
-    try:
-        prompt = build_analyze_prompt(sit, best_policy)
-        text = _call_llm(llm, prompt)
-    except LLMError:
-        raise  # C2：基建失败，穿透到总控的循环边界
-    except Exception:
-        return None  # 其它非预期 → 当作没要到方向，回 rule-based
-    return parse_decision(text)
+    prompt = build_analyze_prompt(sit, best_policy)
+    for _ in range(2):  # 1 次初试 + 1 次重试
+        try:
+            text = _call_llm(llm, prompt)
+        except LLMError:
+            raise  # C2：基建失败，穿透到总控的循环边界
+        except Exception:
+            text = None  # 其它非预期 → 当内容失败，进重试
+        decision = parse_decision(text)
+        if decision is not None:
+            return decision
+    return None
 
 
 def _call_llm(llm: LLMClient, prompt: str) -> str | None:
-    """走 run_agent 取 .text；无 run_agent 或 ok=False → None（analyze 退回 rule-based）。"""
+    """走 run_agent 取 .text；无 run_agent 或 ok=False → None（C1 内容失败，由 _ask_llm 重试）。"""
     runner = getattr(llm, "run_agent", None)
     if not callable(runner):
         return None
