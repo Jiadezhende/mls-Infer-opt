@@ -26,10 +26,9 @@ from ..generate import bootstrap as default_bootstrap
 from ..generate import propose as default_propose
 from ..generate import repair as default_repair
 from ..state.candidate import Candidate, candidate_engine_path
-from ..state.common import utcnow_iso
 from ..state.context import Environment, Limits, Paths, TaskContext
 from ..state.eval import EvalMode, ValidationError, normalized_speedup_score
-from ..state.loop import AgentEvent, EventLevel, LoopState
+from ..state.loop import AgentEvent, EventLevel, LoopState, emit
 from ..state.policy import Policy
 
 __all__ = [
@@ -164,18 +163,18 @@ def run_loop(
     started = time.monotonic()
     _ensure_dirs(ctx)
     _install_observer(state)  # 每条事件实时(a)流 stderr、(b)增量 append results.log
-    _emit(state, "loop 启动", "init", data={"run_id": ctx.run_id})
+    emit(state, "loop 启动", "init", data={"run_id": ctx.run_id})
     _emit_llm_status(state, llm)
 
     try:
         baseline = hooks.bootstrap(ctx)
         baseline = _register_candidate(state, baseline)
-        _emit(state, f"bootstrap 候选：{baseline.id}", "bootstrap", candidate_id=baseline.id)
+        emit(state, f"bootstrap 候选：{baseline.id}", "bootstrap", candidate_id=baseline.id)
         _evaluate_candidate(state, baseline, hooks.evaluate, config.eval_timeout_s)
         if keep_best(state, baseline):
             # bootstrap 提升后 best_score 恰为 baseline，冻结作 speedup 锚点（后续会被更优覆盖）。
             state.baseline_score = state.best_score
-            _emit(
+            emit(
                 state,
                 f"bootstrap 成为 best：{baseline.id}",
                 "keep_best",
@@ -196,7 +195,7 @@ def run_loop(
         try:
             policy = hooks.analyze(state, llm=llm)
         except Exception as e:
-            _emit(state, f"analyze 异常：{e}", "grad", level="error")
+            emit(state, f"analyze 异常：{e}", "grad", level="error")
             policy = None
 
         if policy is None:
@@ -221,7 +220,7 @@ def keep_best(state: LoopState, candidate: Candidate) -> bool:
     """若候选已过 gate 且分数严格更高，则提升为 best。返回是否提升。"""
 
     if candidate.gate is None or not candidate.gate.passed:
-        _emit(
+        emit(
             state,
             f"候选未过 gate，不参与 best：{candidate.id}",
             "keep_best",
@@ -232,7 +231,7 @@ def keep_best(state: LoopState, candidate: Candidate) -> bool:
 
     score = candidate.bench.score if candidate.bench is not None else 0.0
     if score <= state.best_score:
-        _emit(
+        emit(
             state,
             f"候选未提升：{candidate.id}",
             "keep_best",
@@ -257,7 +256,7 @@ def keep_best(state: LoopState, candidate: Candidate) -> bool:
     published = _copy_engine(
         candidate_engine_path(ctx.run_dir, candidate.id), ctx.engine_publish_path
     )
-    _emit(
+    emit(
         state,
         f"提升 best：{candidate.id}",
         "keep_best",
@@ -270,7 +269,7 @@ def keep_best(state: LoopState, candidate: Candidate) -> bool:
         },
     )
     if not published:
-        _emit(
+        emit(
             state,
             f"增量发布失败（finalize 兜底）：{ctx.engine_publish_path}",
             "keep_best",
@@ -301,7 +300,7 @@ def finalize(
     if best is None:
         if not state.stop_reason:
             state.stop_reason = "no_publishable_candidate"
-        _emit(state, "finalize 无 best 可发布", "finalize", level="error")
+        emit(state, "finalize 无 best 可发布", "finalize", level="error")
         _write_artifacts(state, enabled=config.publish_artifacts)
         present.emit(present.fmt_acceptance(state))
         return state
@@ -318,7 +317,7 @@ def finalize(
         if workspace_ok:
             if not state.stop_reason:
                 state.stop_reason = "completed"
-            _emit(
+            emit(
                 state,
                 f"发布 best：{best.id}",
                 "finalize",
@@ -329,7 +328,7 @@ def finalize(
                 },
             )
             if not archive_ok:
-                _emit(
+                emit(
                     state,
                     f"run final engine 留档失败：{archive_path}",
                     "finalize",
@@ -338,7 +337,7 @@ def finalize(
                 )
         else:
             state.stop_reason = "publish_failed"
-            _emit(
+            emit(
                 state,
                 f"发布失败：{ctx.engine_publish_path}",
                 "finalize",
@@ -349,7 +348,7 @@ def finalize(
     else:
         if not state.stop_reason:
             state.stop_reason = "best_failed_final_gate"
-        _emit(
+        emit(
             state,
             f"best 未过最终 gate：{best.id}",
             "finalize",
@@ -379,12 +378,12 @@ def _run_policy_round(
     try:
         candidate = hooks.propose(ctx, policy, parent_code, llm=llm)
     except Exception as e:
-        _emit(state, f"generate.propose 异常：{e}", "generate", level="error")
+        emit(state, f"generate.propose 异常：{e}", "generate", level="error")
         candidate = None
 
     if candidate is None:
         reason = _llm_failure_reason(llm)
-        _emit(
+        emit(
             state,
             "本轮未产出候选" + (f"（{reason}）" if reason else ""),
             "generate",
@@ -393,7 +392,7 @@ def _run_policy_round(
         return False
 
     candidate = _register_candidate(state, candidate)
-    _emit(state, f"生成候选：{candidate.id}", "generate", candidate_id=candidate.id)
+    emit(state, f"生成候选：{candidate.id}", "generate", candidate_id=candidate.id)
     _evaluate_candidate(state, candidate, hooks.evaluate, config.eval_timeout_s)
     if keep_best(state, candidate):
         return True
@@ -416,17 +415,17 @@ def _run_repairs(
     for attempt in range(1, retries + 1):
         parent_code = _read_candidate_code(ctx, cur.id)
         if parent_code is None:
-            _emit(state, f"repair 跳过：候选源码缺失 {cur.id}", "repair", level="warning")
+            emit(state, f"repair 跳过：候选源码缺失 {cur.id}", "repair", level="warning")
             return False
         errors = cur.gate.errors if cur.gate is not None else []
         present.emit(f"  · 修复中（第 {attempt} 次）…")  # 瞬态进度：仅 stderr，不落 results.log
         try:
             repaired = hooks.repair(ctx, policy, parent_code, errors, llm=llm)
         except Exception as e:
-            _emit(state, f"generate.repair 异常：{e}", "repair", level="error")
+            emit(state, f"generate.repair 异常：{e}", "repair", level="error")
             repaired = None
         if repaired is None:
-            _emit(
+            emit(
                 state,
                 "repair 未产出候选",
                 "repair",
@@ -434,7 +433,7 @@ def _run_repairs(
             )
             continue
         repaired = _register_candidate(state, repaired)
-        _emit(
+        emit(
             state,
             f"repair 候选：{repaired.id}",
             "repair",
@@ -491,7 +490,7 @@ def _evaluate_candidate(
             candidate = evaluated
             state.candidates[candidate.id] = candidate
     except Exception as e:
-        _emit(state, f"evaluate 异常：{e}", "evaluate", level="error", candidate_id=candidate.id)
+        emit(state, f"evaluate 异常：{e}", "evaluate", level="error", candidate_id=candidate.id)
         return candidate
 
     _normalize_score(state, candidate)
@@ -514,7 +513,7 @@ def _evaluate_candidate(
         cs = candidate.gate.case_summary or {}
         if "total" in cs:
             data["cases"] = f"{cs.get('passed', '?')}/{cs.get('total', '?')} 通过"
-    _emit(
+    emit(
         state,
         f"评测{'通过' if passed else '失败'}：{candidate.id}",
         "evaluate",
@@ -558,7 +557,7 @@ def _safety_stop(state: LoopState, config: LoopConfig) -> bool:
 
 def _stop(state: LoopState, reason: str, message: str, *, level: EventLevel = "info") -> None:
     state.stop_reason = reason
-    _emit(
+    emit(
         state,
         f"停止：{reason}",
         "stop",
@@ -652,7 +651,7 @@ def _write_artifacts(state: LoopState, *, enabled: bool) -> None:
         # 运行结束的任务结果记录，落本次 run 的独立目录根（runs/{run_id}）。
         (Path(ctx.run_dir) / "report.json").write_text(summary_json, encoding="utf-8")
     except OSError as e:
-        _emit(state, f"artifact 写入失败：{e}", "finalize", level="error")
+        emit(state, f"artifact 写入失败：{e}", "finalize", level="error")
 
 
 def _emit_llm_status(state: LoopState, llm: Any | None) -> None:
@@ -664,7 +663,7 @@ def _emit_llm_status(state: LoopState, llm: Any | None) -> None:
     fp = _llm_fingerprint(llm)
     available = bool(llm is not None and getattr(llm, "available", False))
     if available:
-        _emit(
+        emit(
             state,
             f"LLM 可用：key={fp['api_key']} base_url={fp['base_url']} model={fp['model']}",
             "llm",
@@ -673,7 +672,7 @@ def _emit_llm_status(state: LoopState, llm: Any | None) -> None:
         return
     reason = getattr(llm, "unavailable_reason", None) if llm is not None else None
     reason = reason or "llm client 未装配（None）"
-    _emit(
+    emit(
         state,
         f"LLM 不可用，全程走规则兜底：{reason}"
         f"（key={fp['api_key']} base_url={fp['base_url']} model={fp['model']}）",
@@ -713,24 +712,3 @@ def _llm_failure_reason(llm: Any | None) -> str | None:
     return None
 
 
-def _emit(
-    state: LoopState,
-    message: str,
-    phase: str,
-    *,
-    level: EventLevel = "info",
-    candidate_id: str | None = None,
-    data: dict[str, Any] | None = None,
-) -> None:
-    payload = dict(data or {})
-    payload.setdefault("round", state.round)
-    event = AgentEvent(
-        source="loop",
-        phase=phase,
-        message=message,
-        level=level,
-        candidate_id=candidate_id,
-        ts=utcnow_iso(),
-        data=payload,
-    )
-    state.add_event(event)

@@ -147,7 +147,9 @@ C2 必须穿透。**
         记基建故障、以 `evaluator_infra_failure` 停 run，但总控仍 finalize 发布当前 best（must-publish 不破）。
       - 前提：worker 要把候选自身异常 catch 成结构化 C1 裁决，只有真·进程级死亡才落 C2 分支。
 - [ ] **契约合一**：train 与 eval 各存一份"什么算合法候选" → 合成一份共享定义。
-- [ ] **emit 统一**：事件构造多份私有实现 + data 键名隐式契约 → 统一一个 emit + 一份事件契约。
+- [x] **emit 统一**（已实现，commit）：删除两份私有 `_emit`（trainer / grad），调用点直接调唯一的
+      共享 `state.loop.emit`（统一补 ts / 默认带 round / 走 add_event 实时 sink；source 默认 "loop"，
+      analyze 显式传）。data 跨界键名提成契约一并在 ①②③④ 重构那些键时落。
 - [x] **砍候选缓存 + id 简化**（已实现，commit）：删 trainer 去重分支；id 从 `r{round}-{sha1(code)}`
       改成运行内序号 `c{seq}`（seq = generate 数 `candidates/` 目录数，与 LoopState 解耦）；
       state 层 `make_candidate_id(seq)` 保持纯函数。**保留**：同一候选评测幂等（gate 判空）、oracle 参照缓存。

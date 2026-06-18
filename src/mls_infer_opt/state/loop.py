@@ -25,6 +25,7 @@ __all__ = [
     "AgentEvent",
     "LoopState",
     "candidate_status",
+    "emit",
 ]
 
 EventLevel = Literal["info", "warning", "error"]
@@ -139,3 +140,33 @@ def candidate_status(state: LoopState, candidate_id: str) -> str:
     if state.best_id == candidate_id:
         return "promoted"
     return "measured"
+
+
+def emit(
+    state: LoopState,
+    message: str,
+    phase: str,
+    *,
+    source: str = "loop",
+    level: EventLevel = "info",
+    candidate_id: str | None = None,
+    data: dict[str, Any] | None = None,
+) -> None:
+    """构造并登记一条 AgentEvent——全流程唯一的事件出口，各来源直接调用、不再各搓 AgentEvent。
+
+    统一补 ts（AgentEvent 默认）、默认带当前 ``round``、走 ``LoopState.add_event``（含实时 sink）。
+    ``source`` 标明产生方：默认 ``"loop"``（编排层是主要事件源），analyze / evaluate 等显式传入。
+    ``data`` 是结构化负载（report / 渲染消费；渲染端按 falsy 自动跳过空键）。
+    """
+    payload = dict(data or {})
+    payload.setdefault("round", state.round)
+    state.add_event(
+        AgentEvent(
+            source=source,
+            phase=phase,
+            message=message,
+            level=level,
+            candidate_id=candidate_id,
+            data=payload,
+        )
+    )

@@ -19,7 +19,7 @@ from typing import Any, Protocol
 
 from ..searchspace.policy import aggregate, default_policy, from_json, merge
 from ..state.candidate import candidate_policy_path
-from ..state.loop import AgentEvent, EventLevel, LoopState
+from ..state.loop import LoopState, emit
 from ..state.policy import Policy
 from .heuristic import Decision, hard_stop_reason, heuristic_decision
 from .prompt import build_analyze_prompt, parse_decision
@@ -49,15 +49,17 @@ def analyze(state: LoopState, *, llm: LLMClient | None = None) -> Policy | None:
     try:
         sit = build_situation(state)
     except Exception as e:  # 连态势都建不起来：保守停机，记错。
-        _emit(state, "判停：analyze 建态势异常", f"analyze crashed building situation: {e}",
-              level="error", data={"decision": "stop", "stop_reason": "analyze_error"})
+        emit(state, source="analyze", phase="grad", message="判停：analyze 建态势异常",
+             level="error",
+             data={"detail": f"analyze crashed building situation: {e}",
+                   "decision": "stop", "stop_reason": "analyze_error"})
         return None
 
     # 1. 硬上限判停（确定性，优先于方向）。
     hard = hard_stop_reason(sit)
     if hard is not None:
-        _emit(state, f"判停：{hard}", "", level="info",
-              data={"decision": "stop", "stop_reason": hard, **_situation_data(sit)})
+        emit(state, source="analyze", phase="grad", message=f"判停：{hard}",
+             data={"decision": "stop", "stop_reason": hard, **_situation_data(sit)})
         return None
 
     # 2. 方向：LLM 优先，rule-based 兜底。
@@ -73,9 +75,9 @@ def analyze(state: LoopState, *, llm: LLMClient | None = None) -> Policy | None:
     # 3. analyze（或 LLM）主动判停。
     if decision.action == "stop":
         reason = decision.stop_reason or "analyze_decided_stop"
-        _emit(state, f"判停：{reason}", decision.bottleneck, level="info",
-              data={"decision": "stop", "stop_reason": reason, "used_llm": used_llm,
-                    **_situation_data(sit)})
+        emit(state, source="analyze", phase="grad", message=f"判停：{reason}",
+             data={"detail": decision.bottleneck, "decision": "stop", "stop_reason": reason,
+                   "used_llm": used_llm, **_situation_data(sit)})
         return None
 
     # 4. 从 best 出发叠 delta → 合法的下一个 Policy。
@@ -90,16 +92,19 @@ def analyze(state: LoopState, *, llm: LLMClient | None = None) -> Policy | None:
             rationale=decision.rationale,
         )
     except Exception as e:  # merge 是纯逻辑、理论不抛；兜一层守 never-throw。
-        _emit(state, "判停：analyze 构造 Policy 异常", f"analyze crashed building policy: {e}",
-              level="error", data={"decision": "stop", "stop_reason": "analyze_error"})
+        emit(state, source="analyze", phase="grad", message="判停：analyze 构造 Policy 异常",
+             level="error",
+             data={"detail": f"analyze crashed building policy: {e}",
+                   "decision": "stop", "stop_reason": "analyze_error"})
         return None
 
-    _emit(
+    emit(
         state,
-        f"继续：{decision.bottleneck or '局部搜索下一步'}",
-        decision.rationale,
-        level="info",
+        source="analyze",
+        phase="grad",
+        message=f"继续：{decision.bottleneck or '局部搜索下一步'}",
         data={
+            "detail": decision.rationale,
             "decision": "continue",
             "used_llm": used_llm,
             "axes_delta": decision.axes_delta,
@@ -181,18 +186,3 @@ def _situation_data(sit: Situation) -> dict[str, Any]:
     }
 
 
-def _emit(
-    state: LoopState,
-    message: str,
-    detail: str,
-    *,
-    level: EventLevel = "info",
-    data: dict[str, Any] | None = None,
-) -> None:
-    """append 一条 analyze 事件。**每轮必发**（判停轮 / 无收益轮也发）。绝不写 stop_reason。"""
-    payload = dict(data or {})
-    if detail:
-        payload.setdefault("detail", detail)
-    state.add_event(
-        AgentEvent(source="analyze", phase="grad", message=message, level=level, data=payload)
-    )
