@@ -25,6 +25,7 @@ from ..evaluate import evaluate as default_evaluate
 from ..generate import bootstrap as default_bootstrap
 from ..generate import propose as default_propose
 from ..generate import repair as default_repair
+from ..llm.errors import LLMError  # 仅 errors（零依赖），避免经 llm/__init__ 拉入 present 导入环
 from ..state.candidate import Candidate, candidate_engine_path
 from ..state.context import Environment, Limits, Paths, TaskContext
 from ..state.eval import EvalMode, ValidationError, normalized_speedup_score
@@ -200,7 +201,10 @@ def run_loop(
         present.emit("  · 分析中…")  # 瞬态进度：仅 stderr，不落 results.log
         try:
             result = hooks.analyze(state, llm=llm)
-        except Exception as e:  # analyze 承诺 never-throw；再兜一层，崩了当「无方向」处理。
+        except LLMError as e:  # C2 基建失败穿透到总控边界：记响亮 + 仍 finalize 发布 best-so-far。
+            _stop(state, "llm_infra_failure", f"analyze LLM 调用失败：{e}", level="error")
+            break
+        except Exception as e:  # 其它非预期（analyze 承诺 never-throw）：当「无方向」处理。
             emit(state, f"analyze 异常：{e}", "grad", level="error")
             result = NoMove("analyze_crashed")
 
@@ -210,7 +214,11 @@ def run_loop(
             break
 
         policy = result
-        improved = _run_policy_round(state, policy, llm, hooks, config)
+        try:
+            improved = _run_policy_round(state, policy, llm, hooks, config)
+        except LLMError as e:  # generate 的 C2 同样穿透到此：C2 停 + 仍发布。
+            _stop(state, "llm_infra_failure", f"generate LLM 调用失败：{e}", level="error")
+            break
         state.round = max(state.round, policy.round)
         if not improved:
             state.stale_rounds += 1
@@ -384,6 +392,8 @@ def _run_policy_round(
     present.emit("  · 生成候选中…")  # 瞬态进度：仅 stderr，不落 results.log
     try:
         candidate = hooks.propose(ctx, policy, parent_code, llm=llm)
+    except LLMError:
+        raise  # C2 穿透到 run_loop 边界
     except Exception as e:
         emit(state, f"generate.propose 异常：{e}", "generate", level="error")
         candidate = None
@@ -428,6 +438,8 @@ def _run_repairs(
         present.emit(f"  · 修复中（第 {attempt} 次）…")  # 瞬态进度：仅 stderr，不落 results.log
         try:
             repaired = hooks.repair(ctx, policy, parent_code, errors, llm=llm)
+        except LLMError:
+            raise  # C2 穿透到 run_loop 边界
         except Exception as e:
             emit(state, f"generate.repair 异常：{e}", "repair", level="error")
             repaired = None

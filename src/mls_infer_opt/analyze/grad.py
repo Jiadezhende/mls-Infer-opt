@@ -18,6 +18,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Protocol
 
+from ..llm.errors import LLMError  # 仅 errors（零依赖），避免经 llm/__init__ 拉入 present 导入环
 from ..searchspace.policy import aggregate, default_policy, from_json, merge
 from ..state.candidate import candidate_policy_path
 from ..state.loop import LoopState, emit
@@ -61,7 +62,7 @@ def analyze(state: LoopState, *, llm: LLMClient | None = None) -> Policy | NoMov
     used_llm = False
     decision: Decision | None = None
     if llm is not None and getattr(llm, "available", False):
-        decision = _ask_llm(state, sit, best_policy, llm)
+        decision = _ask_llm(sit, best_policy, llm)
         used_llm = decision is not None
     if decision is None:
         decision = heuristic_decision(sit, best_policy)
@@ -113,15 +114,19 @@ def analyze(state: LoopState, *, llm: LLMClient | None = None) -> Policy | NoMov
 
 
 # === 内部 =============================================================
-def _ask_llm(
-    state: LoopState, sit: Situation, best_policy: Policy, llm: LLMClient
-) -> Decision | None:
-    """问 LLM 要方向；never-throw（LLM 基建已承诺不抛，这里再兜一层）→ 失败返回 None。"""
+def _ask_llm(sit: Situation, best_policy: Policy, llm: LLMClient) -> Decision | None:
+    """问 LLM 要方向。C2（LLMError）穿透交总控；其它意外 → None（回 rule-based）。
+
+    内容层失败（run_agent ok=False / 解析不出 Decision）由 _call_llm/parse_decision 返回 None，
+    属 C1 邻域、回退规则；只有传输/基建失败（run_agent raise LLMCallError）才向上穿透。
+    """
     try:
         prompt = build_analyze_prompt(sit, best_policy)
         text = _call_llm(llm, prompt)
+    except LLMError:
+        raise  # C2：基建失败，穿透到总控的循环边界
     except Exception:
-        return None
+        return None  # 其它非预期 → 当作没要到方向，回 rule-based
     return parse_decision(text)
 
 

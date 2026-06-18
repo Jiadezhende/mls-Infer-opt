@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from mls_infer_opt.analyze import (
     MOVES,
     analyze,
@@ -15,7 +17,7 @@ from mls_infer_opt.analyze import (
     heuristic_decision,
     parse_decision,
 )
-from mls_infer_opt.llm import FakeAgentClient
+from mls_infer_opt.llm import FakeAgentClient, LLMCallError, LLMError
 from mls_infer_opt.searchspace.policy import aggregate, default_policy, to_json
 from mls_infer_opt.state.candidate import Candidate, candidate_policy_path
 from mls_infer_opt.state.context import Limits, Paths, TaskContext
@@ -206,12 +208,21 @@ def test_analyze_falls_back_to_heuristic_on_garbage(tmp_path):
     assert len(events) == 1 and events[0].data["used_llm"] is False
 
 
-def test_analyze_falls_back_on_llm_exception(tmp_path):
+def test_analyze_falls_back_on_unexpected_non_llm_error(tmp_path):
+    # 非 LLMError 的意外异常（现实里 run_agent 会包成 LLMCallError；这里测防御回退）→ 回 heuristic。
     state = make_state(tmp_path)
     llm = FakeAgentClient([RuntimeError("boom")])
     policy = analyze(state, llm=llm)
     assert policy is not None and policy.axes["kv_cache"] == "incremental"
     assert len(_analyze_events(state)) == 1
+
+
+def test_analyze_propagates_c2_llm_infra_error(tmp_path):
+    # C2 传输失败：analyze 不吞、穿透交总控（不再静默降级到 rule-based）。
+    state = make_state(tmp_path)
+    llm = FakeAgentClient([LLMCallError("network down")])
+    with pytest.raises(LLMError):
+        analyze(state, llm=llm)
 
 
 def test_analyze_no_llm_uses_heuristic(tmp_path):

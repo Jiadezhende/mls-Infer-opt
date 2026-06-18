@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from mls_infer_opt.llm import LLMConfig, OpenAIAgentClient, ToolSpec
+import pytest
+
+from mls_infer_opt.llm import LLMCallError, LLMConfig, OpenAIAgentClient, ToolSpec
 
 
 class FakeResponses:
@@ -26,6 +28,22 @@ def test_client_is_unavailable_without_key_and_sdk():
     result = client.run_agent("hello")
     assert result.ok is False
     assert client.unavailable_reason == "missing OPENAI_API_KEY"
+
+
+def test_run_agent_raises_on_transport_failure():
+    """传输层调用失败（create 抛错）= C2 → run_agent raise LLMCallError，不静默吞成 ok=False。"""
+
+    class _Boom:
+        def create(self, **kwargs: Any) -> Any:
+            raise RuntimeError("net down")
+
+    class _Client:
+        responses = _Boom()
+
+    client = OpenAIAgentClient(LLMConfig(api_key="x"), client=_Client())
+    with pytest.raises(LLMCallError):
+        client.run_agent("hi")
+    assert client.last_error and client.last_error["kind"] == "RuntimeError"
 
 
 def test_client_extracts_plain_text_from_response():

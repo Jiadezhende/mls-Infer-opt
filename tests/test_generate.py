@@ -16,7 +16,7 @@ from mls_infer_opt.generate import (
     repair,
 )
 from mls_infer_opt.generate.codegen import _BASELINE_PATH, _MAX_SELF_CHECK_ROUNDS
-from mls_infer_opt.llm import FakeAgentClient, LLMConfig, OpenAIAgentClient
+from mls_infer_opt.llm import FakeAgentClient, LLMConfig, LLMError, OpenAIAgentClient
 from mls_infer_opt.searchspace import aggregate, default_policy, merge
 from mls_infer_opt.state.candidate import candidate_engine_path
 from mls_infer_opt.state.context import Paths, TaskContext
@@ -377,13 +377,14 @@ def test_propose_agent_loop_retries_then_fixes_on_error(tmp_path):
     assert len(fake.responses.calls) == 3  # 两次 check_engine + 终轮 message
 
 
-def test_propose_agent_loop_never_throws_on_create_exception(tmp_path):
-    """Responses.create 抛错 → run_agent 内部吞成 ok=False → 回退无码 → None（不漏给 loop）。"""
+def test_propose_propagates_c2_on_create_exception(tmp_path):
+    """create 抛错 = C2 传输失败 → run_agent raise LLMCallError → propose 穿透（不吞）。"""
     ctx = make_ctx(tmp_path)
     policy = default_policy()
     llm, _ = _agent_client([RuntimeError("net")])
 
-    assert propose(ctx, policy, parent_code=BASELINE_CODE, llm=llm) is None
+    with pytest.raises(LLMError):
+        propose(ctx, policy, parent_code=BASELINE_CODE, llm=llm)
 
 
 def test_propose_agent_loop_returns_none_when_never_passes(tmp_path):

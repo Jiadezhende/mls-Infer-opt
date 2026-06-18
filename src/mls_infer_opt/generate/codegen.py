@@ -31,8 +31,9 @@ from typing import Any, Protocol
 
 from ..evaluate import quick_gate
 
-# 直 import tooling（仅依赖 stdlib）而非 ..llm：避免经 llm/__init__ 拉入
+# 直 import tooling/errors（仅依赖 stdlib）而非 ..llm：避免经 llm/__init__ 拉入
 # openai_client→present 的导入环。
+from ..llm.errors import LLMError
 from ..llm.tooling import ToolResult, ToolSpec
 from ..searchspace.policy import Policy, default_policy, strategy_tags, to_json
 from ..state.candidate import (
@@ -192,8 +193,11 @@ def _generate(
             errors=errors,
             max_self_check_rounds=max_self_check_rounds,
         )
+    except LLMError:
+        # C2 基建失败（run_agent 传输层抛错）：穿透交总控，绝不静默吞成「这轮没收益」。
+        raise
     except Exception:
-        # build_prompt / run_agent / 暂存 / 落盘 等任何意外 → 无收益，不漏给 loop（never-throw）。
+        # 其它意外（build_prompt / 暂存 / 落盘 等）→ 无收益，不漏给 loop（never-throw）。
         return None
 
 

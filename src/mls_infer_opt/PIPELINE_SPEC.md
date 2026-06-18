@@ -138,8 +138,14 @@ C2 必须穿透。**
       `Policy`（迈出的一步）或 `NoMove(reason)`（gradient≈0）。总控读 `NoMove.reason` 直接写
       stop_reason，删掉反扫事件的 `_last_analyze_stop_reason`。停因不再走事件侧信道。
       （用 `Policy | NoMove` 实现 spec §1② 的 `Move | NoMove`，Policy 自身即 Move，省一层包装。）
-- [ ] **C2 穿透**：grad / train 的 LLM 失败目前 never-throw 降级 → 改直接报错。
-- [ ] **LLM 模式**：目前每轮探测可用性 / 中途降级 → 改装配阶段一次性裁定。
+- [x] **C2 穿透**（已实现，commit）：新增 `llm.LLMCallError`；`run_agent` 传输层失败改 raise（内容层
+      失败 empty/max_tool_rounds 仍 ok=False=C1）。grad `_ask_llm` / generate `_generate` 不再吞 LLMError
+      （`except LLMError: raise`），_run_policy_round/_run_repairs 同。总控在循环边界接 LLMError →
+      `stop_reason="llm_infra_failure"` + 仍 finalize 发布 best-so-far（must-publish 不破）。
+- [x] **LLM 模式一次性裁定**（已实现）：`available` 在客户端构造时定一次、运行中不翻；唯一的中途降级
+      （传输失败回退 rule-based）已被 C2 穿透取代。startup `_emit_llm_status` 响亮记一次裁定结果。
+      未配置 → 全程规则（heuristic + 仅 baseline）；配置且不可用 → 响亮警告后走规则（不硬 abort，
+      因 must-exit-0 + baseline 兜底优先）。无需每轮再探测。
 - [ ] **C1 / C2 分离 + 重试策略**：eval 现在把所有失败都翻成同一个 runtime gate →
       按"worker 是否产出结构化裁决"分流：
       - worker 产出裁决（pass/fail）→ 信它，fail = C1，拒候选、继续，**不重试**（eval 确定性）。

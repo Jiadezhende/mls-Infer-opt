@@ -7,8 +7,10 @@
 - OpenAI Responses API 主路径：封装模型调用、function tools、tool loop 与响应提取。
   provider/base_url/model 可由 env 强制覆盖。
 - 配置走 env，自动加载 .env 但不覆盖已 export 的 shell 变量。
-- 健壮性（硬要求）：缺 key / 没装 SDK **不抛异常**——暴露 ``available`` 标志，不可用时调用返回
-  None，由上层走回退。网络调用内置有限次指数退避，最终失败返回 None。
+- 健壮性：缺 key / 没装 SDK **不抛异常**——暴露 ``available`` 标志（构造时一次裁定、运行中不翻），
+  不可用时调用返回 ok=False。**但传输/基建调用失败（C2）会 raise LLMCallError 穿透**——绝不静默
+  降级，由总控在循环边界接住（见 PIPELINE_SPEC §3）。内容层失败（没给答复 / 工具循环没收敛）
+  仍返回 ok=False，属 C1 邻域、上层可回退。
 - 响应解析对各 API 形态防御式提取；从文本稳健抽取代码块并先 compile() 语法检查再用。
 - tool loop 有最大轮数上限；handler 抛错包成结构化错误回灌模型，不中断循环。
 
@@ -18,7 +20,7 @@
 from __future__ import annotations
 
 from .config import LLMConfig
-from .errors import LLMError, LLMUnavailableError, ToolExecutionError
+from .errors import LLMCallError, LLMError, LLMUnavailableError, ToolExecutionError
 from .fake import FakeAgentClient
 from .openai_client import AgentResult, OpenAIAgentClient, ToolCallRecord
 from .tooling import ToolExecutor, ToolRegistry, ToolResult, ToolSpec, to_openai_tools
@@ -27,6 +29,7 @@ __all__ = [
     "LLMConfig",
     "LLMError",
     "LLMUnavailableError",
+    "LLMCallError",
     "ToolExecutionError",
     "FakeAgentClient",
     "AgentResult",

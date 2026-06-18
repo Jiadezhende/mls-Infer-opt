@@ -7,6 +7,7 @@ from typing import Any
 
 from .. import present
 from .config import LLMConfig
+from .errors import LLMCallError
 from .tooling import ToolExecutor, ToolRegistry, ToolResult, ToolSpec
 
 __all__ = ["AgentResult", "ToolCallRecord", "OpenAIAgentClient"]
@@ -161,12 +162,11 @@ class OpenAIAgentClient:
                         }
                     )
         except Exception as exc:
+            # C2 传输/基建失败：穿透抛出，绝不静默降级成 ok=False（由总控在循环边界接住、记 C2
+            # 并仍发布 best-so-far）。_last_error 仍记一笔供指纹/审计。内容层失败（下方 empty /
+            # 上方 max_tool_rounds）才返回 ok=False，属 C1 邻域、调用方可回退。
             self._last_error = {"kind": type(exc).__name__, "message": str(exc)}
-            return AgentResult(
-                ok=False,
-                tool_calls=tool_records,
-                error=self._last_error,
-            )
+            raise LLMCallError(f"LLM call failed: {type(exc).__name__}: {exc}") from exc
 
         self._last_error = {"kind": "empty", "message": "model produced no final answer"}
         return AgentResult(ok=False, tool_calls=tool_records, error=self._last_error)

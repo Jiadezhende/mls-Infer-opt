@@ -7,6 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from mls_infer_opt.llm import LLMCallError
 from mls_infer_opt.loop import LoopConfig, LoopHooks, hard_stop_reason, keep_best, run_loop
 from mls_infer_opt.searchspace.policy import aggregate, default_policy, strategy_tags, to_json
 from mls_infer_opt.state.candidate import (
@@ -198,6 +199,25 @@ def test_run_loop_hard_stops_on_max_stale_rounds(tmp_path: Path):
 
     assert state.stop_reason == "max_stale_rounds_reached"
     assert state.best_score == 1.0  # baseline 始终是 best
+
+
+def test_run_loop_c2_stops_on_llm_infra_failure(tmp_path: Path):
+    """LLM 调用失败（C2）穿透到总控边界 → stop_reason=llm_infra_failure，但仍发布 best-so-far。"""
+    ctx = _ctx(tmp_path)
+
+    def bootstrap(ctx: TaskContext) -> Candidate:
+        return _persist_fake(ctx, default_policy(), "baseline engine", score=1.0)
+
+    def boom_analyze(state: LoopState, *, llm: Any | None = None) -> Policy | NoMove:
+        _ = (state, llm)
+        raise LLMCallError("api down")
+
+    hooks = LoopHooks(bootstrap=bootstrap, analyze=boom_analyze, evaluate=_evaluate_fake)
+    state = run_loop(ctx, hooks=hooks, config=LoopConfig(safety_max_rounds=4))
+
+    assert state.stop_reason == "llm_infra_failure"
+    # must-publish 不破：C2 中止后 finalize 仍把已验证 baseline 发布出去。
+    assert Path(ctx.engine_publish_path).read_text(encoding="utf-8") == "baseline engine"
 
 
 def test_run_loop_bootstraps_and_publishes_when_analyze_stops(tmp_path: Path):
