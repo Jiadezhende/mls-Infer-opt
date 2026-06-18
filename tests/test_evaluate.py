@@ -6,6 +6,7 @@ bench、never-throw）。
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -95,6 +96,77 @@ def _setup_candidate(ctx: TaskContext, code: str, cid: str = "r0-test") -> Candi
         f.write(code)
     _write_weights(ctx)
     return Candidate(id=cid, kind="baseline")
+
+
+# === 0. run_job C1/C2 分流 + 重试（monkeypatch 子进程，无 torch） ======
+def _spec() -> JobSpec:
+    return JobSpec(
+        engine_path="/x/engine.py", weight_dir="/w", model_config={"vocab_size": 100},
+        device="cpu", mode="quick", task="both", seed=11, oracle_cache_path="/c.pt",
+    )
+
+
+def _proc(returncode: int, stdout: str, stderr: str = ""):
+    import types
+
+    return types.SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+def test_run_job_trusts_worker_verdict_without_retry(monkeypatch):
+    from mls_infer_opt.evaluate import runner
+
+    calls: list[int] = []
+
+    def fake_run(*a, **k):
+        calls.append(1)
+        return _proc(0, json.dumps({"gate": {"passed": False}, "bench": None}))
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    out = runner.run_job(_spec())
+    assert out["gate"]["passed"] is False
+    assert len(calls) == 1  # 有裁决（C1/通过）→ 不重试
+
+
+def test_run_job_retries_once_then_raises_c2(monkeypatch):
+    from mls_infer_opt.evaluate import EvaluatorInfraError, runner
+
+    calls: list[int] = []
+
+    def fake_run(*a, **k):
+        calls.append(1)
+        return _proc(1, "", "segfault")  # 非零退出且无 JSON = C2
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    with pytest.raises(EvaluatorInfraError):
+        runner.run_job(_spec())
+    assert len(calls) == 2  # 重试一次
+
+
+def test_run_job_retry_recovers_on_second_attempt(monkeypatch):
+    from mls_infer_opt.evaluate import runner
+
+    seq = [_proc(1, "", "boom"), _proc(0, json.dumps({"gate": {"passed": True}, "bench": None}))]
+    monkeypatch.setattr(runner.subprocess, "run", lambda *a, **k: seq.pop(0))
+    out = runner.run_job(_spec())
+    assert out["gate"]["passed"] is True  # 第二次成功 → 不抛
+
+
+def test_run_job_timeout_is_c1_no_retry(monkeypatch):
+    import subprocess as _sp
+
+    from mls_infer_opt.evaluate import runner
+
+    calls: list[int] = []
+
+    def fake_run(*a, **k):
+        calls.append(1)
+        raise _sp.TimeoutExpired(cmd="worker", timeout=1)
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    out = runner.run_job(_spec(), timeout_s=1)  # 超时 = C1：返回结构化失败、不抛、不重试
+    assert out["gate"]["errors"][0]["stage"] == "runtime"
+    assert "tim" in out["gate"]["errors"][0]["message"].lower()
+    assert len(calls) == 1
 
 
 # === 1. serde（纯逻辑，无 torch / 无子进程） ===========================
@@ -241,16 +313,16 @@ def test_isolation_timeout_does_not_kill_parent(tmp_path, _torch):
     assert "tim" in out.gate.errors[0].message.lower()
 
 
-def test_isolation_hard_crash_is_caught(tmp_path, _torch):
-    crash = "import os\nos._exit(1)\n"  # import 期硬退出，绕过一切兜底
+def test_isolation_hard_crash_escalates_c2(tmp_path, _torch):
+    # import 期硬退出 = 进程级死亡、worker 没产出裁决 = C2 → 重试一次仍死 → evaluate 穿透抛 C2。
+    crash = "import os\nos._exit(1)\n"
     ctx = _make_ctx(tmp_path)
     cand = _setup_candidate(ctx, crash)
 
-    from mls_infer_opt.evaluate import evaluate
+    from mls_infer_opt.evaluate import EvaluatorInfraError, evaluate
 
-    out = evaluate(cand, ctx, "full", timeout_s=60)
-    assert out.gate is not None and not out.gate.passed
-    assert out.gate.errors[0].stage == "runtime"
+    with pytest.raises(EvaluatorInfraError):
+        evaluate(cand, ctx, "full", timeout_s=60)
 
 
 def test_quick_gate_passes_on_baseline(tmp_path, _torch):

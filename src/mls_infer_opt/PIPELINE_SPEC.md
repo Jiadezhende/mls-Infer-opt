@@ -146,7 +146,7 @@ C2 必须穿透。**
       （传输失败回退 rule-based）已被 C2 穿透取代。startup `_emit_llm_status` 响亮记一次裁定结果。
       未配置 → 全程规则（heuristic + 仅 baseline）；配置且不可用 → 响亮警告后走规则（不硬 abort，
       因 must-exit-0 + baseline 兜底优先）。无需每轮再探测。
-- [ ] **C1 / C2 分离 + 重试策略**：eval 现在把所有失败都翻成同一个 runtime gate →
+- [x] **C1 / C2 分离 + 重试策略**（已实现，commit）：新增 `evaluate.EvaluatorInfraError`；run_job
       按"worker 是否产出结构化裁决"分流：
       - worker 产出裁决（pass/fail）→ 信它，fail = C1，拒候选、继续，**不重试**（eval 确定性）。
       - 候选**超时** = C1（候选太慢 / 挂死），拒、继续，**不重试**（重试再烧一个 timeout 且大概率再超）。

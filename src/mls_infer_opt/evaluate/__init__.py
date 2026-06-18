@@ -30,9 +30,9 @@ from ..state.candidate import Candidate, candidate_engine_path
 from ..state.context import TaskContext
 from ..state.eval import BenchResult, EvalMode, GateResult, ValidationError
 from .protocol import JobSpec, bench_from_dict, gate_from_dict
-from .runner import run_job
+from .runner import EvaluatorInfraError, run_job
 
-__all__ = ["evaluate", "run_gate", "run_bench", "quick_gate"]
+__all__ = ["evaluate", "run_gate", "run_bench", "quick_gate", "EvaluatorInfraError"]
 
 # 正确性用固定 seed，保证 oracle expected 与候选输入的确定性可复现。
 _DEFAULT_SEED = 7
@@ -101,8 +101,10 @@ def evaluate(
 ) -> Candidate:
     """评测候选：gate → 过了才 bench → 挂到 candidate（对象图，非外键）→ 返回同一 candidate。
 
-    幂等（candidate.gate 已存在则直接返回，对应「评测昂贵、复用结果」）。全程 never-throw：
-    编排层任何异常都翻成 failed runtime gate，绝不让 loop 崩（不变量 #3）。
+    幂等（candidate.gate 已存在则直接返回，对应「评测昂贵、复用结果」）。这是**权威外层门禁**：
+    候选域失败（C1：gate fail / 超时）翻成 failed gate 照常返回；但**评测器基建失败（C2）穿透**
+    （EvaluatorInfraError，run_job 已重试一次），交总控记 C2 + 仍发布 best-so-far。其它意外仍兜成
+    failed runtime gate（never-throw 安全网）。
     """
     if candidate.gate is not None:
         return candidate
@@ -119,6 +121,8 @@ def evaluate(
         bench_d = result.get("bench")
         if candidate.gate.passed and bench_d:
             candidate.attach_bench(bench_from_dict(bench_d))  # 守护：仅 gate.passed 可挂
+    except EvaluatorInfraError:
+        raise  # C2：评测器基建失败，穿透交总控（绝不糊成 candidate 的 failed gate）
     except Exception as e:
         candidate.gate = _runtime_gate(f"evaluate crashed: {e}")
 

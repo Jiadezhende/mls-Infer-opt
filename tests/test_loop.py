@@ -7,6 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from mls_infer_opt.evaluate import EvaluatorInfraError
 from mls_infer_opt.llm import LLMCallError
 from mls_infer_opt.loop import LoopConfig, LoopHooks, hard_stop_reason, keep_best, run_loop
 from mls_infer_opt.searchspace.policy import aggregate, default_policy, strategy_tags, to_json
@@ -217,6 +218,43 @@ def test_run_loop_c2_stops_on_llm_infra_failure(tmp_path: Path):
 
     assert state.stop_reason == "llm_infra_failure"
     # must-publish 不破：C2 中止后 finalize 仍把已验证 baseline 发布出去。
+    assert Path(ctx.engine_publish_path).read_text(encoding="utf-8") == "baseline engine"
+
+
+def test_run_loop_evaluator_c2_stops_and_keeps_published_best(tmp_path: Path):
+    """循环中评测器基建失败（C2）穿透总控边界 → evaluator_infra_failure，已发布 best 仍在盘上。"""
+    ctx = _ctx(tmp_path)
+
+    def bootstrap(ctx: TaskContext) -> Candidate:
+        return _persist_fake(ctx, default_policy(), "baseline engine", score=1.0)
+
+    def propose(
+        ctx: TaskContext, policy: Policy, parent_code: str, *, llm: Any | None
+    ) -> Candidate | None:
+        _ = (parent_code, llm)
+        return _persist_fake(ctx, policy, "optimized engine", score=2.0)
+
+    calls = {"n": 0}
+
+    def flaky_eval(
+        candidate: Candidate, ctx: TaskContext, mode: EvalMode = "full",
+        *, timeout_s: float | None = None,
+    ) -> Candidate:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _evaluate_fake(candidate, ctx, mode, timeout_s=timeout_s)  # baseline 评测正常
+        raise EvaluatorInfraError("worker exited with code 1")  # 优化轮评测器进程级死亡
+
+    hooks = LoopHooks(
+        bootstrap=bootstrap,
+        analyze=_scripted_analyze([_kv_policy, _kv_policy]),
+        propose=propose,
+        evaluate=flaky_eval,
+    )
+    state = run_loop(ctx, hooks=hooks, config=LoopConfig(safety_max_rounds=4))
+
+    assert state.stop_reason == "evaluator_infra_failure"
+    # baseline 早已增量发布；C2 中止后仍是盘上 best（未退化）。
     assert Path(ctx.engine_publish_path).read_text(encoding="utf-8") == "baseline engine"
 
 

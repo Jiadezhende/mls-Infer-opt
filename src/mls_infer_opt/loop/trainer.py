@@ -21,6 +21,7 @@ from typing import Any, Protocol
 
 from .. import present
 from ..analyze import analyze as default_analyze
+from ..evaluate import EvaluatorInfraError
 from ..evaluate import evaluate as default_evaluate
 from ..generate import bootstrap as default_bootstrap
 from ..generate import propose as default_propose
@@ -185,6 +186,8 @@ def run_loop(
             present.emit(present.fmt_banner(state))
         else:
             _stop(state, "bootstrap_failed", "bootstrap 未产生可发布候选", level="error")
+    except EvaluatorInfraError as e:
+        _stop(state, "evaluator_infra_failure", f"bootstrap 评测器基建失败：{e}", level="error")
     except Exception as e:
         _stop(state, "bootstrap_error", f"bootstrap crashed: {e}", level="error")
 
@@ -218,6 +221,9 @@ def run_loop(
             improved = _run_policy_round(state, policy, llm, hooks, config)
         except LLMError as e:  # generate 的 C2 同样穿透到此：C2 停 + 仍发布。
             _stop(state, "llm_infra_failure", f"generate LLM 调用失败：{e}", level="error")
+            break
+        except EvaluatorInfraError as e:  # evaluate 的 C2 穿透到此：C2 停 + 仍发布。
+            _stop(state, "evaluator_infra_failure", f"评测器基建失败：{e}", level="error")
             break
         state.round = max(state.round, policy.round)
         if not improved:
@@ -321,7 +327,14 @@ def finalize(
         return state
 
     if best.gate is None:
-        _evaluate_candidate(state, best, hooks.evaluate, config.final_eval_timeout_s)
+        try:
+            _evaluate_candidate(state, best, hooks.evaluate, config.final_eval_timeout_s)
+        except EvaluatorInfraError as e:
+            # 终发复核遇评测器基建失败：记 C2、不发布未复核 best（增量发布的上一个 best 仍在盘上）。
+            if not state.stop_reason:
+                state.stop_reason = "evaluator_infra_failure"
+            emit(state, f"finalize 评测器基建失败：{e}", "finalize", level="error",
+                 candidate_id=best.id)
 
     if best.gate is not None and best.gate.passed:
         src = candidate_engine_path(ctx.run_dir, best.id)
@@ -508,6 +521,8 @@ def _evaluate_candidate(
         if evaluated is not candidate:
             candidate = evaluated
             state.candidates[candidate.id] = candidate
+    except EvaluatorInfraError:
+        raise  # C2 评测器基建失败：穿透到总控边界（bootstrap / 循环 / finalize 各自接住）
     except Exception as e:
         emit(state, f"evaluate 异常：{e}", "evaluate", level="error", candidate_id=candidate.id)
         return candidate
