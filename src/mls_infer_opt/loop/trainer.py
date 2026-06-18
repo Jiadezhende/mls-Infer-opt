@@ -29,7 +29,7 @@ from ..state.candidate import Candidate, candidate_engine_path
 from ..state.context import Environment, Limits, Paths, TaskContext
 from ..state.eval import EvalMode, ValidationError, normalized_speedup_score
 from ..state.loop import AgentEvent, EventLevel, LoopState, emit
-from ..state.policy import Policy
+from ..state.policy import NoMove, Policy
 
 __all__ = [
     "AnalyzeFn",
@@ -41,6 +41,7 @@ __all__ = [
     "RepairFn",
     "build_task_context",
     "finalize",
+    "hard_stop_reason",
     "keep_best",
     "run_loop",
 ]
@@ -51,7 +52,7 @@ class BootstrapFn(Protocol):
 
 
 class AnalyzeFn(Protocol):
-    def __call__(self, state: LoopState, *, llm: Any | None = None) -> Policy | None: ...
+    def __call__(self, state: LoopState, *, llm: Any | None = None) -> Policy | NoMove: ...
 
 
 class ProposeFn(Protocol):
@@ -188,21 +189,27 @@ def run_loop(
 
     while state.best_id and not state.stop_reason:
         _tick_budget(state, started)
+        # 停止准则归总控：先看硬上限（预算 / 轮数 / 连续无提升），再看未配 max_rounds 的安全保险。
+        reason = hard_stop_reason(state)
+        if reason is not None:
+            _stop(state, reason, "硬上限触发")
+            break
         if _safety_stop(state, config):
             break
 
         present.emit("  · 分析中…")  # 瞬态进度：仅 stderr，不落 results.log
         try:
-            policy = hooks.analyze(state, llm=llm)
-        except Exception as e:
+            result = hooks.analyze(state, llm=llm)
+        except Exception as e:  # analyze 承诺 never-throw；再兜一层，崩了当「无方向」处理。
             emit(state, f"analyze 异常：{e}", "grad", level="error")
-            policy = None
+            result = NoMove("analyze_crashed")
 
-        if policy is None:
-            reason = _last_analyze_stop_reason(state) or "analyze_stopped"
-            _stop(state, reason, "analyze 返回停止")
+        # analyze 只算方向：NoMove 表示迈不出步，由总控（这里）裁决终止并写 stop_reason。
+        if isinstance(result, NoMove):
+            _stop(state, result.reason, "analyze 无方向")
             break
 
+        policy = result
         improved = _run_policy_round(state, policy, llm, hooks, config)
         state.round = max(state.round, policy.round)
         if not improved:
@@ -536,11 +543,19 @@ def _read_candidate_code(ctx: TaskContext, candidate_id: str) -> str | None:
         return None
 
 
-def _last_analyze_stop_reason(state: LoopState) -> str | None:
-    for event in reversed(state.events):
-        if event.source == "analyze" and event.data.get("decision") == "stop":
-            reason = event.data.get("stop_reason")
-            return reason if isinstance(reason, str) and reason else None
+def hard_stop_reason(state: LoopState) -> str | None:
+    """硬上限判停（总控的循环准则）：到上限即返回停因，否则 None。每条仅在对应 limit > 0 时生效。
+
+    确定性、只读 limits + 实时量（budget.elapsed_s / round / stale_rounds）。从 analyze 上移到这里
+    （停止是训练循环的准则、不是 gradient 的活）；达标 / 收益不足等软停由 analyze 的 NoMove 表达。
+    """
+    limits = state.task_context.limits
+    if limits.time_budget_s > 0 and state.budget.elapsed_s >= limits.time_budget_s:
+        return "time_budget_exhausted"
+    if limits.max_rounds > 0 and state.round >= limits.max_rounds:
+        return "max_rounds_reached"
+    if limits.max_stale_rounds > 0 and state.stale_rounds >= limits.max_stale_rounds:
+        return "max_stale_rounds_reached"
     return None
 
 

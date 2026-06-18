@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from mls_infer_opt.loop import LoopConfig, LoopHooks, keep_best, run_loop
+from mls_infer_opt.loop import LoopConfig, LoopHooks, hard_stop_reason, keep_best, run_loop
 from mls_infer_opt.searchspace.policy import aggregate, default_policy, strategy_tags, to_json
 from mls_infer_opt.state.candidate import (
     Candidate,
@@ -18,7 +18,7 @@ from mls_infer_opt.state.candidate import (
 from mls_infer_opt.state.context import Limits, Paths, TaskContext
 from mls_infer_opt.state.eval import BenchResult, EvalMode, GateResult, ValidationError
 from mls_infer_opt.state.loop import AgentEvent, LoopState
-from mls_infer_opt.state.policy import Policy
+from mls_infer_opt.state.policy import NoMove, Policy
 
 
 def _ctx(tmp_path: Path, *, limits: Limits | None = None) -> TaskContext:
@@ -98,17 +98,9 @@ def _evaluate_fake(
 
 
 def _stop_analyze(reason: str = "done"):
-    def analyze(state: LoopState, *, llm: Any | None = None) -> Policy | None:
-        _ = llm
-        state.add_event(
-            AgentEvent(
-                source="analyze",
-                phase="grad",
-                message=f"stop {reason}",
-                data={"decision": "stop", "stop_reason": reason},
-            )
-        )
-        return None
+    def analyze(state: LoopState, *, llm: Any | None = None) -> Policy | NoMove:
+        _ = (state, llm)
+        return NoMove(reason)  # analyze 只产 NoMove；停因由总控读取并写 stop_reason
 
     return analyze
 
@@ -118,7 +110,7 @@ def _scripted_analyze(
     *,
     stop_reason: str = "done",
 ):
-    def analyze(state: LoopState, *, llm: Any | None = None) -> Policy | None:
+    def analyze(state: LoopState, *, llm: Any | None = None) -> Policy | NoMove:
         _ = llm
         if not steps:
             return _stop_analyze(stop_reason)(state)
@@ -156,6 +148,56 @@ def _kv_policy(state: LoopState) -> Policy:
         )
     )
     return policy
+
+
+# === hard_stop_reason（总控硬上限判停，从 analyze 上移） =============
+def test_hard_stop_inactive_when_limits_zero(tmp_path: Path):
+    state = LoopState(task_context=_ctx(tmp_path), round=99, stale_rounds=99)  # 默认 limits 全 0
+    assert hard_stop_reason(state) is None
+
+
+def test_hard_stop_each_limit(tmp_path: Path):
+    rounds = LoopState(task_context=_ctx(tmp_path, limits=Limits(max_rounds=5)), round=5)
+    assert hard_stop_reason(rounds) == "max_rounds_reached"
+
+    stale = LoopState(
+        task_context=_ctx(tmp_path, limits=Limits(max_stale_rounds=3)), stale_rounds=3
+    )
+    assert hard_stop_reason(stale) == "max_stale_rounds_reached"
+
+    timed = LoopState(task_context=_ctx(tmp_path, limits=Limits(time_budget_s=10)))
+    timed.budget.elapsed_s = 11.0
+    assert hard_stop_reason(timed) == "time_budget_exhausted"
+
+
+def test_hard_stop_under_limit_returns_none(tmp_path: Path):
+    state = LoopState(task_context=_ctx(tmp_path, limits=Limits(max_rounds=5)), round=2)
+    assert hard_stop_reason(state) is None
+
+
+def test_run_loop_hard_stops_on_max_stale_rounds(tmp_path: Path):
+    """非提升轮把 stale_rounds 推到上限 → 总控在下一轮顶部硬停（不再依赖 analyze 判停）。"""
+    ctx = _ctx(tmp_path, limits=Limits(max_stale_rounds=1))
+
+    def bootstrap(ctx: TaskContext) -> Candidate:
+        return _persist_fake(ctx, default_policy(), "baseline engine", score=1.0)
+
+    def propose(
+        ctx: TaskContext, policy: Policy, parent_code: str, *, llm: Any | None
+    ) -> Candidate | None:
+        _ = (parent_code, llm)
+        return _persist_fake(ctx, policy, "slower engine", score=0.5)
+
+    hooks = LoopHooks(
+        bootstrap=bootstrap,
+        analyze=_scripted_analyze([_kv_policy, _kv_policy, _kv_policy]),
+        propose=propose,
+        evaluate=_evaluate_fake,
+    )
+    state = run_loop(ctx, hooks=hooks, config=LoopConfig(safety_max_rounds=10))
+
+    assert state.stop_reason == "max_stale_rounds_reached"
+    assert state.best_score == 1.0  # baseline 始终是 best
 
 
 def test_run_loop_bootstraps_and_publishes_when_analyze_stops(tmp_path: Path):

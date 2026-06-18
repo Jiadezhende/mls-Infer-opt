@@ -133,10 +133,11 @@ C2 必须穿透。**
 逐项对照 §1 完整性表 + §3 分类法，标出缺哪几项、哪些 C2 被当成 C1 吞了。
 **下列改动方向均已确认；`[ ]` 追踪实现进度，尚未动代码。**
 
-- [ ] **职责泄漏**：grad（analyze）现在自己判硬停（`hard_stop_reason`）+ 返回 `None` 当停 →
-      停止准则应**上移总控**，grad 收窄为 `Move | NoMove`。
-- [ ] **无损契约**：grad 返回目前是 `Policy | None` + 停因走事件侧信道 → 改 `Move | NoMove(reason)`，
-      总控写 stop_reason。
+- [x] **职责泄漏 + 无损契约**（已实现，commit）：grad 不再判硬停——`hard_stop_reason` 上移总控
+      （`loop.hard_stop_reason(state)`，每轮顶部检查预算/轮数/stale）。grad 收窄为只算方向：返回
+      `Policy`（迈出的一步）或 `NoMove(reason)`（gradient≈0）。总控读 `NoMove.reason` 直接写
+      stop_reason，删掉反扫事件的 `_last_analyze_stop_reason`。停因不再走事件侧信道。
+      （用 `Policy | NoMove` 实现 spec §1② 的 `Move | NoMove`，Policy 自身即 Move，省一层包装。）
 - [ ] **C2 穿透**：grad / train 的 LLM 失败目前 never-throw 降级 → 改直接报错。
 - [ ] **LLM 模式**：目前每轮探测可用性 / 中途降级 → 改装配阶段一次性裁定。
 - [ ] **C1 / C2 分离 + 重试策略**：eval 现在把所有失败都翻成同一个 runtime gate →
@@ -146,7 +147,10 @@ C2 必须穿透。**
       - worker 起不来 / 非零退出且无 JSON / 输出非法 = 疑似 C2 → **重试一次**；仍失败 → **升级 C2**：
         记基建故障、以 `evaluator_infra_failure` 停 run，但总控仍 finalize 发布当前 best（must-publish 不破）。
       - 前提：worker 要把候选自身异常 catch 成结构化 C1 裁决，只有真·进程级死亡才落 C2 分支。
-- [ ] **契约合一**：train 与 eval 各存一份"什么算合法候选" → 合成一份共享定义。
+- [~] **契约合一**（跳过）：澄清后发现并非"实现两遍"——gate 运行期逻辑已单源（quick / full 同走
+      worker `gate.run_gate`，只差 mode），quick(被 generate 包成 agent 自检工具) vs full(loop 固定
+      门禁) 的内/外切分是**故意保留**的。真正散在三处的是"API 契约知识"（check_self_contained 静态 /
+      ENGINE_CONTRACT 文字 / gate 运行期冒烟），是不同目的的不同表示、不强合。API 漂移风险接受，暂跳过。
 - [x] **emit 统一**（已实现，commit）：删除两份私有 `_emit`（trainer / grad），调用点直接调唯一的
       共享 `state.loop.emit`（统一补 ts / 默认带 round / 走 add_event 实时 sink；source 默认 "loop"，
       analyze 显式传）。data 跨界键名提成契约一并在 ①②③④ 重构那些键时落。

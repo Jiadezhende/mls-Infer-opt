@@ -1,13 +1,14 @@
-"""grad — analyze 的编排入口：汇总态势 → 判停 / 给方向 → 产下一个 Policy，并每轮记一条事件。
+"""grad — analyze 的编排入口：汇总态势 → 给方向（或无方向）→ 产下一个 Policy，并每轮记一条事件。
 
-每轮循环的「大脑」。控制权全程在确定性代码里：先看硬上限判停，再问 LLM 要方向（单次调用 +
-确定性解析，见 prompt.py），LLM 不可用 / 失败 / 产垃圾就退回 rule-based 阶梯（heuristic.py）。
+每轮循环的「大脑」=求梯度：只算「往哪走」。问 LLM 要方向（单次调用 + 确定性解析，见 prompt.py），
+LLM 不可用 / 失败 / 产垃圾就退回 rule-based 阶梯（heuristic.py）。
 
 不变量纪律：
-- **never-throw**：任何异常都翻成一条 error 事件 + 返回 None（= 停，best 已是安全产物）。
-- **无发布权 / 不判定 stop_reason**：analyze 只产 Policy 或 None，并 **每轮** emit 一条
-  ``source="analyze"`` 事件（见 [[analyze-record-via-events]]）；停因放进事件
-  ``data["stop_reason"]``，由 loop 读后落到 ``LoopState.stop_reason`` 收尾——analyze **绝不**自写。
+- **只算方向、不判停**：analyze 返回 ``Policy``（迈出的一步）或 ``NoMove(reason)``（gradient≈0，
+  迈不出）。**硬上限判停（预算 / 轮数 / 连续无提升）不在这里**——那是总控的循环准则（见 loop）。
+- **never-throw**：内部任何异常都翻成一条 error 事件 + 返回 ``NoMove("analyze_error")``。
+- **无发布权 / 不写 stop_reason**：每轮 emit 一条 ``source="analyze"`` 事件作记录（见
+  [[analyze-record-via-events]]）；是否因 NoMove 终止、停因落 ``LoopState.stop_reason``，由总控定。
 - 下一个 Policy 由 ``searchspace.policy.merge(best_policy, axes_delta=…, …, rationale=…)`` 构造，
   knob 只进 Policy.knobs，绝不碰 model_config（merge/aggregate 焊死）。
 """
@@ -20,8 +21,8 @@ from typing import Any, Protocol
 from ..searchspace.policy import aggregate, default_policy, from_json, merge
 from ..state.candidate import candidate_policy_path
 from ..state.loop import LoopState, emit
-from ..state.policy import Policy
-from .heuristic import Decision, hard_stop_reason, heuristic_decision
+from ..state.policy import NoMove, Policy
+from .heuristic import Decision, heuristic_decision
 from .prompt import build_analyze_prompt, parse_decision
 from .situation import Situation, build_situation
 
@@ -41,28 +42,21 @@ class LLMClient(Protocol):
     ) -> Any: ...
 
 
-def analyze(state: LoopState, *, llm: LLMClient | None = None) -> Policy | None:
-    """看反馈定方向，产下一个 Policy（带 rationale）或 None（停）。每轮 emit 一条 analyze 事件。
+def analyze(state: LoopState, *, llm: LLMClient | None = None) -> Policy | NoMove:
+    """只算方向：产下一个 Policy，或 NoMove(reason)（迈不出步）。每轮 emit 一条 analyze 事件。
 
-    never-throw：内部任何异常都记一条 error 事件并返回 None（停，best 兜底）。
+    硬上限判停不在这里——是总控的循环准则。never-throw：内部异常 → 记错 + NoMove("analyze_error")。
     """
     try:
         sit = build_situation(state)
-    except Exception as e:  # 连态势都建不起来：保守停机，记错。
-        emit(state, source="analyze", phase="grad", message="判停：analyze 建态势异常",
+    except Exception as e:  # 连态势都建不起来：无方向可算，记错交总控。
+        emit(state, source="analyze", phase="grad", message="无方向：analyze 建态势异常",
              level="error",
              data={"detail": f"analyze crashed building situation: {e}",
                    "decision": "stop", "stop_reason": "analyze_error"})
-        return None
+        return NoMove("analyze_error")
 
-    # 1. 硬上限判停（确定性，优先于方向）。
-    hard = hard_stop_reason(sit)
-    if hard is not None:
-        emit(state, source="analyze", phase="grad", message=f"判停：{hard}",
-             data={"decision": "stop", "stop_reason": hard, **_situation_data(sit)})
-        return None
-
-    # 2. 方向：LLM 优先，rule-based 兜底。
+    # 1. 方向：LLM 优先，rule-based 兜底。
     best_policy = _load_best_policy(state)
     used_llm = False
     decision: Decision | None = None
@@ -72,15 +66,15 @@ def analyze(state: LoopState, *, llm: LLMClient | None = None) -> Policy | None:
     if decision is None:
         decision = heuristic_decision(sit, best_policy)
 
-    # 3. analyze（或 LLM）主动判停。
+    # 2. 无方向（LLM 判定到位 / 阶梯走完）→ NoMove，交总控裁决是否终止。
     if decision.action == "stop":
-        reason = decision.stop_reason or "analyze_decided_stop"
-        emit(state, source="analyze", phase="grad", message=f"判停：{reason}",
+        reason = decision.stop_reason or "no_direction"
+        emit(state, source="analyze", phase="grad", message=f"无方向：{reason}",
              data={"detail": decision.bottleneck, "decision": "stop", "stop_reason": reason,
                    "used_llm": used_llm, **_situation_data(sit)})
-        return None
+        return NoMove(reason)
 
-    # 4. 从 best 出发叠 delta → 合法的下一个 Policy。
+    # 3. 从 best 出发叠 delta → 合法的下一个 Policy。
     try:
         agg = merge(
             best_policy,
@@ -92,11 +86,11 @@ def analyze(state: LoopState, *, llm: LLMClient | None = None) -> Policy | None:
             rationale=decision.rationale,
         )
     except Exception as e:  # merge 是纯逻辑、理论不抛；兜一层守 never-throw。
-        emit(state, source="analyze", phase="grad", message="判停：analyze 构造 Policy 异常",
+        emit(state, source="analyze", phase="grad", message="无方向：analyze 构造 Policy 异常",
              level="error",
              data={"detail": f"analyze crashed building policy: {e}",
                    "decision": "stop", "stop_reason": "analyze_error"})
-        return None
+        return NoMove("analyze_error")
 
     emit(
         state,

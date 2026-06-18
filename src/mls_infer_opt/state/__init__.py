@@ -48,7 +48,7 @@ from .common import to_dict, utcnow_iso
 from .context import Environment, Limits, Paths, TaskContext
 from .eval import BenchResult, EvalMode, GateResult, GateStage, ValidationError
 from .loop import AgentEvent, BudgetUsage, EventLevel, LoopState, candidate_status
-from .policy import Policy
+from .policy import NoMove, Policy
 
 __all__ = [
     # candidate
@@ -71,6 +71,7 @@ __all__ = [
     "BenchResult",
     # policy
     "Policy",
+    "NoMove",
     # loop
     "EventLevel",
     "BudgetUsage",

@@ -14,7 +14,19 @@ from typing import Any
 
 from .candidate import CandidateKind
 
-__all__ = ["Policy"]
+__all__ = ["Policy", "NoMove"]
+
+
+@dataclass(frozen=True)
+class NoMove:
+    """analyze 的「无方向」结果（gradient≈0）：搜索空间走到头 / LLM 判定到位 / analyze 内部出错。
+
+    analyze 的返回是 ``Policy | NoMove``——``Policy`` 是迈出的一步，``NoMove`` 表示这一步迈不出，
+    并带上 ``reason`` 交总控。analyze **不判停、不写 stop_reason**：要不要因此终止、停因落到
+    ``LoopState.stop_reason``，由总控（loop）裁决（停止是训练循环的准则，不是 gradient 的活）。
+    """
+
+    reason: str
 
 
 @dataclass

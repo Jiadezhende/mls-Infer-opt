@@ -12,7 +12,6 @@ from mls_infer_opt.analyze import (
     analyze,
     build_analyze_prompt,
     build_situation,
-    hard_stop_reason,
     heuristic_decision,
     parse_decision,
 )
@@ -22,6 +21,7 @@ from mls_infer_opt.state.candidate import Candidate, candidate_policy_path
 from mls_infer_opt.state.context import Limits, Paths, TaskContext
 from mls_infer_opt.state.eval import BenchResult, GateResult, ValidationError
 from mls_infer_opt.state.loop import LoopState
+from mls_infer_opt.state.policy import NoMove
 
 
 # === 夹具 =============================================================
@@ -104,28 +104,7 @@ def test_build_situation_derives_best_and_failures(tmp_path):
     assert any("logits mismatch" in e.message for e in sit.recent_failures)
 
 
-# === 2. hard_stop_reason（纯逻辑） ===================================
-def test_hard_stop_inactive_when_limits_zero(tmp_path):
-    state = make_state(tmp_path, round=99, stale_rounds=99)  # 默认 Limits 全 0 → 不生效
-    assert hard_stop_reason(build_situation(state)) is None
-
-
-def test_hard_stop_each_limit(tmp_path):
-    rounds = make_state(tmp_path, round=5, limits=Limits(max_rounds=5))
-    assert hard_stop_reason(build_situation(rounds)) == "max_rounds_reached"
-
-    stale = make_state(tmp_path, stale_rounds=3, limits=Limits(max_stale_rounds=3))
-    assert hard_stop_reason(build_situation(stale)) == "max_stale_rounds_reached"
-
-    timed = make_state(tmp_path, limits=Limits(time_budget_s=10))
-    timed.budget.elapsed_s = 11.0
-    assert hard_stop_reason(build_situation(timed)) == "time_budget_exhausted"
-
-
-def test_hard_stop_under_limit_returns_none(tmp_path):
-    state = make_state(tmp_path, round=2, limits=Limits(max_rounds=5))
-    assert hard_stop_reason(build_situation(state)) is None
-
+# === 2. 硬上限判停已上移总控（见 test_loop.test_hard_stop_*）；analyze 不再判停 ====
 
 # === 3. heuristic_decision（贪心阶梯，纯逻辑） =======================
 def test_heuristic_picks_kv_cache_first_from_baseline(tmp_path):
@@ -250,23 +229,22 @@ def test_analyze_unavailable_llm_uses_heuristic(tmp_path):
     assert not down.prompts  # 不可用 → 根本没问 LLM
 
 
-def test_analyze_hard_stop_returns_none_and_records_event(tmp_path):
+def test_analyze_ignores_hard_limits_now_in_loop(tmp_path):
+    # 硬上限判停已上移总控：analyze 即便 stale 到上限也只算方向（不再判停），返回 Policy。
     state = make_state(tmp_path, stale_rounds=3, limits=Limits(max_stale_rounds=3))
-    policy = analyze(state, llm=None)
-    assert policy is None
-    events = _analyze_events(state)
-    assert len(events) == 1
-    assert events[0].data["decision"] == "stop"
-    assert events[0].data["stop_reason"] == "max_stale_rounds_reached"
-    # analyze 绝不自己写 stop_reason，交给 loop
-    assert state.stop_reason == ""
+    result = analyze(state, llm=None)
+    assert not isinstance(result, NoMove)
+    assert result.axes["kv_cache"] == "incremental"  # 仍给阶梯首步方向
 
 
-def test_analyze_llm_stop_decision_returns_none(tmp_path):
+def test_analyze_llm_stop_decision_returns_nomove(tmp_path):
     state = make_state(tmp_path)
     llm = FakeAgentClient([_json_block('{"action":"stop","stop_reason":"target_reached"}')])
-    policy = analyze(state, llm=llm)
-    assert policy is None
+    result = analyze(state, llm=llm)
+    assert isinstance(result, NoMove)
+    assert result.reason == "target_reached"
+    # analyze 绝不自己写 stop_reason，交给总控
+    assert state.stop_reason == ""
     events = _analyze_events(state)
     assert len(events) == 1 and events[0].data["stop_reason"] == "target_reached"
 

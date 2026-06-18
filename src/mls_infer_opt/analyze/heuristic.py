@@ -1,10 +1,10 @@
-"""heuristic — 确定性决策：判停（hard stop）+ rule-based 方向（greedy ladder）。
+"""heuristic — 确定性方向：rule-based 贪心阶梯（greedy ladder）+ 共享 ``Decision`` 类型。
 
 LLM 是「可选增益」：不可用 / 失败时 analyze 退化到这里，靠优化主线先验做局部搜索，**不抛异常、
-仍给出合法方向或明确停因**。也提供 ``Decision`` 这个 analyze 内部的共享决策类型（LLM 解析与
-rule-based 都产出它，由 grad 统一消费）。
+仍给出合法方向或「无方向」**。``Decision`` 是 analyze 内部的共享决策类型（LLM 解析与 rule-based
+都产出它，由 grad 统一消费 → Policy 或 NoMove）。
 
-判停优先于方向：先看硬上限（预算 / 轮数 / 连续无提升）是否已到，再谈往哪走。
+硬上限判停（预算 / 轮数 / 连续无提升）不在这里——那是总控的循环准则（见 loop.hard_stop_reason）。
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from ..searchspace.space import AXIS_BY_KEY
 from ..state.policy import Policy
 from .situation import Situation
 
-__all__ = ["Action", "Decision", "hard_stop_reason", "MOVES", "heuristic_decision"]
+__all__ = ["Action", "Decision", "MOVES", "heuristic_decision"]
 
 Action = Literal["continue", "stop"]
 
@@ -35,21 +35,6 @@ class Decision:
     rationale: str = ""
     bottleneck: str = ""
     stop_reason: str = ""
-
-
-# === 判停（确定性硬门）===============================================
-def hard_stop_reason(sit: Situation) -> str | None:
-    """到硬上限即返回停因字符串，否则 None。每条仅在对应 limit > 0（已配置）时生效。
-
-    成本/达标类软停（收益不足等）交给 stale_rounds 与 LLM 判断；这里只管不可逾越的硬墙。
-    """
-    if sit.time_budget_s > 0 and sit.elapsed_s >= sit.time_budget_s:
-        return "time_budget_exhausted"
-    if sit.max_rounds > 0 and sit.round >= sit.max_rounds:
-        return "max_rounds_reached"
-    if sit.max_stale_rounds > 0 and sit.stale_rounds >= sit.max_stale_rounds:
-        return "max_stale_rounds_reached"
-    return None
 
 
 # === rule-based 方向（贪心阶梯）======================================

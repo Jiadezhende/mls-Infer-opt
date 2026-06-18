@@ -39,6 +39,7 @@ from .trainer import (
     RepairFn,
     build_task_context,
     finalize,
+    hard_stop_reason,
     keep_best,
     run_loop,
 )
@@ -53,6 +54,7 @@ __all__ = [
     "RepairFn",
     "build_task_context",
     "finalize",
+    "hard_stop_reason",
     "keep_best",
     "run_loop",
 ]
