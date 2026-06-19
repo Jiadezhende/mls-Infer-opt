@@ -18,7 +18,7 @@ from mls_infer_opt.generate import (
 from mls_infer_opt.generate.codegen import _BASELINE_PATH, _MAX_SELF_CHECK_ROUNDS
 from mls_infer_opt.llm import FakeAgentClient, LLMConfig, LLMError, OpenAIAgentClient
 from mls_infer_opt.searchspace import aggregate, default_policy, merge
-from mls_infer_opt.state.candidate import candidate_engine_path
+from mls_infer_opt.state.candidate import candidate_dir, candidate_engine_path
 from mls_infer_opt.state.context import Paths, TaskContext
 from mls_infer_opt.state.eval import ValidationError
 
@@ -226,7 +226,8 @@ def test_propose_persists_candidate_on_good_llm(tmp_path):
     assert cand is not None
     assert cand.kind == "optimization"
     assert cand.parent_id == "r0-base"
-    assert "attention:sdpa" in cand.strategy_tags
+    # honest tags：回退文本路径无 agent 采用回报 → 空 tags（不再照 policy 的 sdpa 撒谎）。
+    assert cand.strategy_tags == []
     # 真落盘
     import os
     assert os.path.exists(candidate_engine_path(ctx.run_dir, cand.id))
@@ -307,14 +308,25 @@ class _FakeOpenAI:
         self.responses = _FakeResponses(outputs)
 
 
-def _check_engine_call(code: str, call_id: str = "c1") -> dict:
-    """一轮模型请求调 check_engine(code=...) 的 Responses output item。"""
+def _check_engine_call(
+    code: str,
+    call_id: str = "c1",
+    *,
+    applied_axes: dict | None = None,
+    applied_knobs: dict | None = None,
+) -> dict:
+    """一轮模型请求调 check_engine(code, applied_axes?, applied_knobs?) 的 Responses item。"""
+    args: dict = {"code": code}
+    if applied_axes is not None:
+        args["applied_axes"] = applied_axes
+    if applied_knobs is not None:
+        args["applied_knobs"] = applied_knobs
     return {
         "output": [
             {
                 "type": "function_call",
                 "name": "check_engine",
-                "arguments": json.dumps({"code": code}),
+                "arguments": json.dumps(args),
                 "call_id": call_id,
             }
         ]
@@ -345,6 +357,55 @@ def test_propose_agent_loop_degrades_without_weights(tmp_path):
     assert persisted == BASELINE_CODE  # 持久化「过 check_engine 的码」
     # 模型确实拿到了 check_engine 工具
     assert "check_engine" in [t["name"] for t in fake.responses.calls[0]["tools"]]
+
+
+def _read_applied(ctx: TaskContext, cand_id: str) -> dict:
+    return json.loads(
+        Path(f"{candidate_dir(ctx.run_dir, cand_id)}/applied.json").read_text(encoding="utf-8")
+    )
+
+
+def test_propose_agent_report_drives_honest_tags(tmp_path):
+    """agent 过门时回报 applied_axes/knobs → strategy_tags 取自回报（过词表闸），与 policy 无关。"""
+    ctx = make_ctx(tmp_path)  # 无权重 → 静态过即捕获回报
+    # policy 下发 attention=sdpa，但 agent 自述实际只动了 kv_cache（且夹带一个非法轴 bogus）。
+    policy = aggregate(
+        {"attention": "sdpa"}, kind="optimization", parent_id="r0-base"
+    ).policy
+    llm, _ = _agent_client(
+        [
+            _check_engine_call(
+                BASELINE_CODE,
+                applied_axes={"kv_cache": "incremental", "bogus": "x"},
+                applied_knobs={"kv_capacity_init": 128},
+            ),
+            _final_message(),
+        ]
+    )
+
+    cand = propose(ctx, policy, parent_code=BASELINE_CODE, llm=llm)
+    assert cand is not None
+    # honest：tags 来自 agent 回报、过 sanitize（bogus 被丢），不再来自 policy 的 attention:sdpa。
+    assert cand.strategy_tags == ["kv_cache:incremental"]
+    assert "attention:sdpa" not in cand.strategy_tags
+    # applied.json 留档实际采用（axes 已过词表闸，knobs 原样）。
+    applied = _read_applied(ctx, cand.id)
+    assert applied["applied_axes"] == {"kv_cache": "incremental"}
+    assert applied["applied_knobs"] == {"kv_capacity_init": 128}
+
+
+def test_propose_agent_no_report_yields_empty_tags(tmp_path):
+    """agent 过门但没回报 applied_axes → 空 tags（诚实「未报」），不照 policy 撒谎。"""
+    ctx = make_ctx(tmp_path)
+    policy = aggregate(
+        {"attention": "sdpa"}, kind="optimization", parent_id="r0-base"
+    ).policy
+    llm, _ = _agent_client([_check_engine_call(BASELINE_CODE), _final_message()])
+
+    cand = propose(ctx, policy, parent_code=BASELINE_CODE, llm=llm)
+    assert cand is not None
+    assert cand.strategy_tags == []
+    assert _read_applied(ctx, cand.id)["applied_axes"] == {}
 
 
 def test_propose_agent_loop_passes_quick_gate_with_weights(tmp_path):

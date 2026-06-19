@@ -22,6 +22,7 @@ from .policy import (
     from_json,
     grouped_axes,
     merge,
+    sanitize_axes,
     strategy_tags,
     to_json,
 )
@@ -60,6 +61,7 @@ __all__ = [
     "aggregate",
     "default_policy",
     "merge",
+    "sanitize_axes",
     "strategy_tags",
     "grouped_axes",
     "to_json",
