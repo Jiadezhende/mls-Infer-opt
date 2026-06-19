@@ -23,6 +23,7 @@ check_engine 的码」，挂到 candidate.gate 的只有外层 loop 跑的 full 
 from __future__ import annotations
 
 import ast
+import json
 import os
 import re
 from collections.abc import Mapping
@@ -35,9 +36,16 @@ from ..evaluate import quick_gate
 # openai_client→present 的导入环。
 from ..llm.errors import LLMError
 from ..llm.tooling import ToolResult, ToolSpec
-from ..searchspace.policy import Policy, default_policy, strategy_tags, to_json
+from ..searchspace.policy import (
+    Policy,
+    default_policy,
+    sanitize_axes,
+    to_json,
+)
+from ..searchspace.space import AXIS_BY_KEY
 from ..state.candidate import (
     Candidate,
+    candidate_dir,
     candidate_engine_path,
     candidate_policy_path,
     make_candidate_id,
@@ -74,6 +82,9 @@ _AGENT_SELF_CHECK_INSTRUCTIONS = (
     "重复直到 passed=true。\n"
     "4. 你最近一次让 check_engine 返回 passed=true 的入参代码，就是最终采用的 engine.py——"
     "务必让那次调用包含完整、可直接运行的单文件源码。\n"
+    "5. 在过门的那次 check_engine 调用里，同时用 applied_axes / applied_knobs 如实回报你这份代码"
+    "**实际采用**了搜索空间里哪些非默认轴及其参数（取值须在菜单内，没动的轴不要报）——"
+    "这关系到后续分析的准确性，不要照搬建议、要据实填。\n"
     "不要 import mls_infer_opt；遵守 prompt 里的 API 契约与自包含硬规则。"
 )
 
@@ -131,7 +142,8 @@ def bootstrap(ctx: TaskContext) -> Candidate:
     problems = check_self_contained(code)
     if problems:  # 自带基线不自包含属开发期 bug，应当场暴露（这是兜底基石）。
         raise RuntimeError(f"baseline asset failed self-containment: {problems}")
-    return _persist(ctx, default_policy(), code)
+    # baseline 即全默认轴：无「采用的非默认轴」→ 空 tags（诚实）。
+    return _persist(ctx, default_policy(), code, applied_axes={}, applied_knobs={})
 
 
 def propose(
@@ -213,9 +225,9 @@ def _generate_agent_loop(
 ) -> Candidate | None:
     """agent 持有 check_engine 工具、内部边写边自检；返回过门候选或 None。"""
     prompt = build_prompt(policy, ctx, mode=mode, parent_code=parent_code, errors=errors)
-    captured: dict[str, str] = {}
+    captured: dict[str, Any] = {}
     tool = _build_check_engine_tool(ctx, captured)
-    result = llm.run_agent(  # type: ignore[attr-defined]
+    result = llm.run_agent(
         prompt,
         tools=[tool],
         instructions=_AGENT_SELF_CHECK_INSTRUCTIONS,
@@ -223,27 +235,44 @@ def _generate_agent_loop(
     )
 
     code = captured.get("code")
-    if code is not None:  # agent 已让 check_engine 返回 passed → 该码即已验证
-        return _persist(ctx, policy, code)
+    if isinstance(code, str):  # agent 已让 check_engine 返回 passed → 该码即已验证
+        return _persist(
+            ctx,
+            policy,
+            code,
+            applied_axes=captured.get("applied_axes", {}),
+            applied_knobs=captured.get("applied_knobs", {}),
+        )
 
     # 回退：模型没成功调用工具（或末次没过）→ 抽最终文本，确定性复核后才出候选。
-    # 绝不持久化未经 gate 的码。
+    # 绝不持久化未经 gate 的码。回退路径没有 agent 的采用回报 → 空 axes/knobs（诚实「未报」）。
     text = getattr(result, "text", None) if getattr(result, "ok", False) else None
     code = _extract_code(text) if text else None
     if code is None or check_self_contained(code):
         return None
     gate = _quick_self_check(ctx, code)
     if gate is None or gate.passed:
-        return _persist(ctx, policy, code)
+        return _persist(ctx, policy, code, applied_axes={}, applied_knobs={})
     return None
 
 
-def _build_check_engine_tool(ctx: TaskContext, captured: dict[str, str]) -> ToolSpec:
+def _build_check_engine_tool(ctx: TaskContext, captured: dict[str, Any]) -> ToolSpec:
     """造 agent 的内层自检工具：收完整 engine.py 源码 → 静态 + quick 门 → {passed, errors}。
 
-    过门（或无权重无法自检的降级）时把该码写进 ``captured``，供调用方持久化；不过则只回错误、不写。
+    过门（或无权重无法自检的降级）时把该码连同 agent 回报的 ``applied_axes/applied_knobs`` 写进
+    ``captured``，供调用方持久化作 honest tags；不过则只回错误、不写。回报是 agent 对**这份码实际
+    采用了哪些非默认轴**的自述，落盘前由 ``sanitize_axes`` 词表过滤（见 _persist），既诚实又干净。
     自检 ephemeral：只写 run_dir/_staging、不进 LoopState。handler 防御式产 ToolResult。
     """
+
+    def _capture(code: str, args: Mapping[str, Any]) -> None:
+        captured["code"] = code
+        raw_axes = args.get("applied_axes")
+        captured["applied_axes"] = (
+            {str(k): str(v) for k, v in raw_axes.items()} if isinstance(raw_axes, dict) else {}
+        )
+        raw_knobs = args.get("applied_knobs")
+        captured["applied_knobs"] = dict(raw_knobs) if isinstance(raw_knobs, dict) else {}
 
     def _handler(args: Mapping[str, Any]) -> ToolResult:
         code = args.get("code")
@@ -256,12 +285,12 @@ def _build_check_engine_tool(ctx: TaskContext, captured: dict[str, str]) -> Tool
 
         gate = _quick_self_check(ctx, code)
         if gate is None:  # 无权重 / 暂存写失败：无法 quick 自检，降级交外层 full gate 把关
-            captured["code"] = code
+            _capture(code, args)
             return ToolResult.success(
                 {"passed": True, "errors": [], "note": "static-only (no weights)"}
             )
         if gate.passed:
-            captured["code"] = code
+            _capture(code, args)
             return ToolResult.success({"passed": True, "errors": []})
         return ToolResult.success(
             {"passed": False, "errors": [_error_to_payload(e) for e in gate.errors]}
@@ -272,10 +301,22 @@ def _build_check_engine_tool(ctx: TaskContext, captured: dict[str, str]) -> Tool
         description=(
             "校验候选 engine.py：跑自包含静态规则 + quick 正确性门（对官方 reference 比 logits）。"
             "返回 {passed: bool, errors: [...]}；passed=false 时按 errors 修代码后重试。"
+            "过门时一并用 applied_axes/applied_knobs 如实回报这份码实际采用的非默认轴及参数。"
         ),
         parameters={
             "type": "object",
-            "properties": {"code": {"type": "string"}},
+            "properties": {
+                "code": {"type": "string"},
+                "applied_axes": {
+                    "type": "object",
+                    "description": "实际采用的非默认轴 {轴名:选项名}，取值须在菜单内",
+                    "additionalProperties": {"type": "string"},
+                },
+                "applied_knobs": {
+                    "type": "object",
+                    "description": "实际采用的 knob {knob名: 值}；仅被激活轴的 knob。",
+                },
+            },
             "required": ["code"],
             "additionalProperties": False,
         },
@@ -338,21 +379,57 @@ def _next_seq(run_dir: str) -> int:
     return sum(1 for p in base.iterdir() if p.is_dir())
 
 
-def _persist(ctx: TaskContext, policy: Policy, code: str) -> Candidate:
-    """落盘候选工作目录（engine.py + policy.json），分配序号 id，返回 Candidate 元数据。"""
+def _persist(
+    ctx: TaskContext,
+    policy: Policy,
+    code: str,
+    *,
+    applied_axes: Mapping[str, str],
+    applied_knobs: Mapping[str, Any],
+) -> Candidate:
+    """落盘候选工作目录（engine.py + policy.json + applied.json），分配序号 id，返回 Candidate。
+
+    ``strategy_tags`` 取自 agent **实际回报**的 applied_axes（过 ``sanitize_axes`` 词表闸），
+    不再来自 analyze 下发、无人遵守的 policy 定点——这是 honest tags 的咽喉点。applied.json 留档
+    agent 自述的实际采用（axes + knobs），供审计。policy.json 仍留（PR-A 不删定点）。
+    """
     run_dir = ctx.run_dir
     cid = make_candidate_id(_next_seq(run_dir))
     engine_path = candidate_engine_path(run_dir, cid)
     os.makedirs(os.path.dirname(engine_path), exist_ok=True)
     Path(engine_path).write_text(code, encoding="utf-8")
     Path(candidate_policy_path(run_dir, cid)).write_text(to_json(policy), encoding="utf-8")
+
+    applied = sanitize_axes(applied_axes)
+    tags = _applied_tags(applied)
+    Path(f"{candidate_dir(run_dir, cid)}/applied.json").write_text(
+        json.dumps(
+            {"applied_axes": applied, "applied_knobs": dict(applied_knobs),
+             "rationale": policy.rationale},
+            sort_keys=True, ensure_ascii=False, indent=2,
+        ),
+        encoding="utf-8",
+    )
     return Candidate(
         id=cid,
         kind=policy.kind,
         round=policy.round,
         parent_id=policy.parent_id,
-        strategy_tags=strategy_tags(policy),
+        strategy_tags=tags,
     )
+
+
+def _applied_tags(applied: Mapping[str, str]) -> list[str]:
+    """把已过词表闸的实际采用 axes 渲成 ``axis:option`` tags：只列非默认轴，按 AXES 声明顺序。
+
+    与 searchspace.strategy_tags 同口径，但吃 axes dict（PR-A 阶段 strategy_tags 仍吃 Policy，
+    故此处内联；PR-B 会把 strategy_tags 统一收为吃 axes dict）。
+    """
+    return [
+        f"{key}:{applied[key]}"
+        for key in AXIS_BY_KEY
+        if key in applied and applied[key] != AXIS_BY_KEY[key].default
+    ]
 
 
 def check_self_contained(code: str) -> list[str]:

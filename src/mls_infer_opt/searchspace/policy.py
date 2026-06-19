@@ -36,11 +36,29 @@ __all__ = [
     "aggregate",
     "default_policy",
     "merge",
+    "sanitize_axes",
     "strategy_tags",
     "grouped_axes",
     "to_json",
     "from_json",
 ]
+
+
+def sanitize_axes(raw: Mapping[str, str]) -> dict[str, str]:
+    """把任意来源的 axes 过滤到「已知轴 + 合法选项」，丢未知/非法，**不填默认**。
+
+    与 ``_normalize_axes`` 的区别：那是「铺满全轴的恒合法定点」（聚合用）；这里只保留确有取值的合法
+    轴，是 agent 回报实际采用轴 / analyze 松建议进入 prompt 前的词表闸——既诚实（只留真值）又干净
+    （越界即丢）。按 AXES 声明顺序输出，保证 strategy_tags / 序列化可复现。
+    """
+    out: dict[str, str] = {}
+    for key in AXIS_BY_KEY:  # 按声明顺序遍历，过滤 raw
+        if key not in raw:
+            continue
+        value = raw[key]
+        if value in AXIS_BY_KEY[key].options:
+            out[key] = value
+    return out
 
 
 @dataclass
