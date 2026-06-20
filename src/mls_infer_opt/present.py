@@ -120,11 +120,9 @@ _BLOCK_KEYS: tuple[tuple[str, str], ...] = (
     ("gate_error", "fail_reason"),
     ("cases", "cases"),
     ("bottleneck", "bottleneck"),
-    ("axes_delta", "axes_delta"),
-    ("knobs_delta", "knobs_delta"),
-    ("next_strategy_tags", "strategy"),
+    ("suggest_axes", "strategy"),
+    ("knobs", "knobs"),
     ("detail", "rationale"),
-    ("fixes", "fixes"),
     ("stop_reason", "stop_reason"),
     ("used_llm", "used_llm"),
 )
@@ -365,8 +363,10 @@ def reasoning_trace(state: Any) -> list[dict[str, Any]]:
                     "decision": data.get("decision"),
                     "bottleneck": data.get("bottleneck") or "",
                     "rationale": data.get("detail") or "",
-                    "strategy_tags": list(data.get("next_strategy_tags") or []),
-                    "knobs_delta": dict(data.get("knobs_delta") or {}),
+                    # analyze 的松建议（方向）；实际采用 strategy_tags 在评测后从候选回填（honest）
+                    "suggest_axes": dict(data.get("suggest_axes") or {}),
+                    "knobs": dict(data.get("knobs") or {}),
+                    "strategy_tags": [],
                     "used_llm": bool(data.get("used_llm", False)),
                 }
                 if data.get("stop_reason"):
@@ -381,12 +381,14 @@ def reasoning_trace(state: Any) -> list[dict[str, Any]]:
                     cur["score"] = score
                     cur["delta"] = (score - prev_score) if prev_score is not None else None
                     prev_score = score
-                # 由 candidate_id 反查候选：补分项（哪个轴动了）+ 血缘（从谁 fork）。
+                # 由 candidate_id 反查候选：补分项（哪个轴动了）+ 血缘（从谁 fork）+ 实际采用轴。
                 cand = state.candidates.get(ev.candidate_id) if ev.candidate_id else None
                 if cand is not None:
                     if cand.bench is not None:
                         cur["score_breakdown"] = score_breakdown(cand.bench)
                     cur["parent_id"] = cand.parent_id
+                    # strategy_tags 来自 agent 实际回报，非 analyze 建议——诚实记录这轮真动了什么。
+                    cur["strategy_tags"] = list(cand.strategy_tags)
         return trace
     except Exception:  # noqa: BLE001 — 叙事采集绝不拖垮 finalize 落盘
         return []
@@ -444,8 +446,9 @@ def stream_event(event: Any) -> None:
         bits = []
         if data.get("bottleneck"):
             bits.append(f"bottleneck={data['bottleneck']}")
-        if data.get("next_strategy_tags"):
-            bits.append("strategy=" + ", ".join(str(t) for t in data["next_strategy_tags"]))
+        if data.get("suggest_axes"):
+            sg = ", ".join(f"{k}={v}" for k, v in data["suggest_axes"].items())
+            bits.append(f"strategy={sg}")
         extra = f"  ({'; '.join(bits)})" if bits else ""
     else:
         bits = [f"{k}={data[k]}" for k in _STREAM_KEYS if data.get(k) is not None]

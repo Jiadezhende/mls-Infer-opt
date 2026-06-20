@@ -2,7 +2,7 @@
 
 聚合 best/history/budget 的主状态（LoopState）、实时预算（BudgetUsage）、事件流（AgentEvent）。
 
-analyze 每轮的「下一步」不再单列结构：它直接产出下一个 Policy（带 rationale，见 searchspace），
+analyze 每轮的「下一步」不再单列结构：它直接产出下一个 Gradient（带 rationale，见 state.gradient），
 判停时返回 None、停因落到 LoopState.stop_reason。
 
 LoopState 是整个 run 唯一的主状态实例，贯穿全程；候选构成内存对象图，gate/bench 直接挂在

@@ -78,7 +78,7 @@ class TaskContext:
 
     model_config 含模型结构字段（num_hidden_layers / hidden_size / heads / head_dim /
     vocab_size / rope_theta …），**只读**、由 engine 动态读取，绝不进入搜索空间
-    （搜索空间见 searchspace.space；可调 knob 只属 Policy.knobs）。
+    （搜索维度见 searchspace.space；可调 knob 属搜索维度 / Gradient.knobs）。
     """
 
     model_config: dict[str, Any] = field(default_factory=dict)

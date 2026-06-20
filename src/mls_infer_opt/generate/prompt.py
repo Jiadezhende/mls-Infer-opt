@@ -1,13 +1,13 @@
-"""prompt — 把 Policy + 生成规范拼成喂给 LLM 的提示词（纯文本，无副作用、无 LLM 调用）。
+"""prompt — 把 Gradient + 生成规范拼成喂给 LLM 的提示词（纯文本，无副作用、无 LLM 调用）。
 
-初版的 policy→engine 不做确定性 render，而是把「生成规范 + 选定策略」注入 prompt 让 LLM 直接
-产出完整 engine.py。本模块只负责拼 prompt：
+policy→engine 不做确定性 render：把「生成规范 + 完整搜索维度（界） + 依赖规则 + analyze 的松建议」
+注入 prompt，让 agent 在维度界内自由探索、产出完整 engine.py。本模块只负责拼 prompt：
 
 - ``ENGINE_CONTRACT``：注入每个 prompt 的稳定知识（API 契约 / 自包含规则 / 正确性目标 / 输出格式）。
-- ``build_prompt``：把 Policy 的非默认轴渲成中文策略指令（复用 space 的 AxisSpec.summary），
-  叠上 model_config、参考代码、analyze 方向（policy.rationale，propose）或结构化报错（repair）。
+- ``build_prompt``：叠上 model_config、参考代码、完整搜索维度 + 依赖规则、analyze 方向
+  （Gradient.suggest_axes 松建议 + rationale，propose）或结构化报错（repair）。
 
-LLM 调用、产物抽取、自包含校验、落盘都在 codegen.py。
+LLM 调用、产物抽取、自包含校验、回报落盘都在 codegen.py。
 """
 
 from __future__ import annotations
@@ -15,12 +15,14 @@ from __future__ import annotations
 import json
 from typing import Literal
 
-from ..searchspace.policy import Policy, grouped_axes
-from ..searchspace.space import AXIS_BY_KEY, GROUP_ORDER
+from ..searchspace.compat import render_constraints
+from ..searchspace.dims import render_search_dims
+from ..searchspace.space import AXIS_BY_KEY
 from ..state.context import TaskContext
 from ..state.eval import ValidationError
+from ..state.gradient import Gradient
 
-__all__ = ["ENGINE_CONTRACT", "build_prompt", "render_policy_instructions"]
+__all__ = ["ENGINE_CONTRACT", "build_prompt", "render_suggestions"]
 
 PromptMode = Literal["propose", "repair"]
 
@@ -55,18 +57,18 @@ ENGINE_CONTRACT = """\
 """
 
 
-def render_policy_instructions(policy: Policy) -> str:
-    """把 Policy 的**非默认轴**渲成中文策略清单（默认轴 = baseline 行为，不提）。"""
-    groups = grouped_axes(policy)
+def render_suggestions(gradient: Gradient) -> str:
+    """把 analyze 的松建议渲成中文清单：建议优先探索的轴 + 配套 knob。空则明确放手。"""
     lines: list[str] = []
-    for group in GROUP_ORDER:
-        for axis, option in groups[group].items():
-            spec = AXIS_BY_KEY[axis]
-            knobs = [f"{k.key}={policy.knobs[k.key]}" for k in spec.knobs if k.key in policy.knobs]
-            suffix = f"（参数：{', '.join(knobs)}）" if knobs else ""
-            lines.append(f"- {axis} = {option}：{spec.summary}{suffix}")
+    for axis, option in gradient.suggest_axes.items():
+        spec = AXIS_BY_KEY.get(axis)
+        summary = spec.summary if spec is not None else ""
+        lines.append(f"- {axis} = {option}：{summary}")
+    if gradient.knobs:
+        kv = ", ".join(f"{k}={v}" for k, v in gradient.knobs.items())
+        lines.append(f"- 配套参数建议：{kv}")
     if not lines:
-        return "- 无（保持保守 baseline 实现即可）"
+        return "- 无具体建议：请在上方搜索维度界内自行判断该动哪些轴。"
     return "\n".join(lines)
 
 
@@ -84,7 +86,7 @@ def _format_error(e: ValidationError) -> str:
 
 
 def build_prompt(
-    policy: Policy,
+    gradient: Gradient,
     ctx: TaskContext,
     *,
     mode: PromptMode,
@@ -93,8 +95,8 @@ def build_prompt(
 ) -> str:
     """拼出完整 prompt。
 
-    propose：parent_code 作参考基线 + policy.rationale 给方向；
-    repair：parent_code 作待修代码 + errors 定向。
+    propose：parent_code 作参考基线 + 完整搜索维度（界）+ 依赖规则 + analyze 松建议/rationale；
+    repair：parent_code 作待修代码 + errors 定向（维度/规则仍给作上下文）。
     """
     parts: list[str] = [ENGINE_CONTRACT, ""]
 
@@ -107,17 +109,23 @@ def build_prompt(
         if mode == "repair":
             parts.append("## 待修复的 engine.py（正确性未过，请在此基础上定向修复）")
         else:
-            parts.append("## 参考基线 engine.py（在此基础上按下方策略改写）")
+            parts.append("## 参考基线 engine.py（在此基础上探索优化）")
         parts.append("```python")
         parts.append(parent_code)
         parts.append("```")
 
-    parts.append("## 本次要采用的优化策略")
-    parts.append(render_policy_instructions(policy))
+    # 完整搜索维度 = 探索边界；依赖规则供自洽（非法组合交 full gate 拦）。
+    parts.append("## 可探索的搜索维度（在这些轴/选项内自由组合）")
+    parts.append(render_search_dims())
+    parts.append("## 轴间依赖（尽量自洽）")
+    parts.append(render_constraints())
 
-    if mode == "propose" and policy.rationale:
-        parts.append("## analyze 方向提示")
-        parts.append(policy.rationale)
+    if mode == "propose":
+        parts.append("## analyze 的方向建议（松提示，最终采用由你定）")
+        parts.append(render_suggestions(gradient))
+        if gradient.rationale:
+            parts.append("## analyze 方向提示")
+            parts.append(gradient.rationale)
 
     if mode == "repair" and errors:
         parts.append("## 上次正确性失败，请定向修复")

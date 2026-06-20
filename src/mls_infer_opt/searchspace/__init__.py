@@ -1,30 +1,24 @@
 """searchspace — analyze 与 generate 共享的搜索空间领域层（依赖只向下到 state）。
 
-把「优化引擎的搜索空间 + 如何在其中导航/落点」抽成独立一层，介于 state（纯 dataclass 契约）与
+把「优化引擎的搜索维度 + 围着它的工具」抽成独立一层，介于 state（纯 dataclass 契约）与
 generate/analyze（消费方）之间：
 
-- ``space``   搜索空间声明：按组件分层的轴/选项/knobs（唯一真相源，纯声明、零依赖）。
-- ``compat``  轴间冲突校验与消解（依赖方让步，决定性）。
-- ``policy``  Policy 聚合：normalize → resolve → fill knobs → 合法可复现 Policy + strategy_tags。
+- ``space``   搜索维度声明：按组件分层的轴/选项/knobs（唯一真相源，纯声明、零依赖）。
+- ``compat``  轴间依赖约束声明 + 渲成 prompt 规则（不再消解成定点，交 full gate 拦非法组合）。
+- ``dims``    维度工具：sanitize_axes 词表闸 / strategy_tags / grouped_axes / render_search_dims。
 
-generate 据此把 Policy 渲成 engine.py；analyze 据此从 best 叠 ``axes_delta`` 构造下一个合法 Policy。
-两者都向下 import 本层，彼此不再横向 import——搜索空间不属于任一阶段的业务，而是它们共享的领域模型。
+analyze 与 generate 都向下 import 本层、把搜索维度渲进各自 prompt，agent 在维度界内自由探索；
+彼此不再横向 import——搜索维度不属于任一阶段的业务，而是它们共享的领域模型。
 """
 
 from __future__ import annotations
 
-from .compat import CONSTRAINTS, Requires, Violation, resolve, validate
-from .policy import (
-    AggregateResult,
-    Policy,
-    aggregate,
-    default_policy,
-    from_json,
+from .compat import CONSTRAINTS, Requires, render_constraints
+from .dims import (
     grouped_axes,
-    merge,
+    render_search_dims,
     sanitize_axes,
     strategy_tags,
-    to_json,
 )
 from .space import (
     AXES,
@@ -52,18 +46,10 @@ __all__ = [
     # compat
     "CONSTRAINTS",
     "Requires",
-    "Violation",
-    "validate",
-    "resolve",
-    # policy
-    "Policy",
-    "AggregateResult",
-    "aggregate",
-    "default_policy",
-    "merge",
+    "render_constraints",
+    # dims
     "sanitize_axes",
     "strategy_tags",
     "grouped_axes",
-    "to_json",
-    "from_json",
+    "render_search_dims",
 ]

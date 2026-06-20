@@ -4,7 +4,7 @@
 
 - bootstrap：产一个保守、语义正确的初始 engine，不依赖 LLM、随时可得，既是搜索起点也是永久兜底。
   源码即 generate/assets/baseline_engine.py（pristine baseline 副本）。
-- propose：按 analyze 产出的 Policy（带 rationale：瓶颈/方向/注意点）产新候选。
+- propose：按 analyze 产出的 Gradient（松建议 + rationale：瓶颈/方向/注意点）产新候选。
 - repair：外层 full gate 没过时，拿结构化报错让 agent 调整（agent 内部的自修复不单列候选）。
 
 生成方式（方案1 · agent 自带工具自闭环）：给 agent 提供 Read/Edit/Write（候选暂存区）+ quick
@@ -21,10 +21,10 @@
 产出：Candidate（kind ∈ baseline|optimization|repair，带 parent_id/lineage）。
 依赖：llm、state。bootstrap/propose/repair 的内部拆分与签名 TBD。
 
-搜索空间（space / compat / Policy 聚合）已抽到独立的 ``searchspace`` 领域层，generate 与 analyze
+搜索维度（space / compat 约束 / dims 工具）已抽到独立的 ``searchspace`` 领域层，generate 与 analyze
 都向下依赖它、彼此不再横向 import。本包只保留「产 engine 代码」自身的两件事：
 
-- prompt  Policy + 生成规范 → LLM prompt（纯文本拼接）
+- prompt  Gradient + 完整搜索维度 + 生成规范 → LLM prompt（纯文本拼接）
 - codegen bootstrap/propose/repair：驱动 agent 工具自闭环（写 + quick 自检）→ 自包含校验 →
   落盘，返回 Candidate|None（实现待从 one-shot 迁移到 tool-loop）
 """
@@ -39,13 +39,13 @@ from .codegen import (
     propose,
     repair,
 )
-from .prompt import ENGINE_CONTRACT, build_prompt, render_policy_instructions
+from .prompt import ENGINE_CONTRACT, build_prompt, render_suggestions
 
 __all__ = [
     # prompt
     "ENGINE_CONTRACT",
     "build_prompt",
-    "render_policy_instructions",
+    "render_suggestions",
     # codegen
     "LLMClient",
     "baseline_engine_source",

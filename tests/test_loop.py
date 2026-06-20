@@ -10,17 +10,16 @@ from typing import Any
 from mls_infer_opt.evaluate import EvaluatorInfraError
 from mls_infer_opt.llm import LLMCallError
 from mls_infer_opt.loop import LoopConfig, LoopHooks, hard_stop_reason, keep_best, run_loop
-from mls_infer_opt.searchspace.policy import aggregate, default_policy, strategy_tags, to_json
+from mls_infer_opt.searchspace.dims import strategy_tags
 from mls_infer_opt.state.candidate import (
     Candidate,
     candidate_engine_path,
-    candidate_policy_path,
     make_candidate_id,
 )
 from mls_infer_opt.state.context import Limits, Paths, TaskContext
 from mls_infer_opt.state.eval import BenchResult, EvalMode, GateResult, ValidationError
+from mls_infer_opt.state.gradient import Gradient, NoMove
 from mls_infer_opt.state.loop import AgentEvent, LoopState
-from mls_infer_opt.state.policy import NoMove, Policy
 
 
 def _ctx(tmp_path: Path, *, limits: Limits | None = None) -> TaskContext:
@@ -39,25 +38,28 @@ def _ctx(tmp_path: Path, *, limits: Limits | None = None) -> TaskContext:
 
 def _persist_fake(
     ctx: TaskContext,
-    policy: Policy,
+    gradient: Gradient,
     code: str,
     *,
     passed: bool = True,
     score: float = 1.0,
 ) -> Candidate:
+    """镜像 generate._persist：落 engine.py、按 Gradient 血缘产 Candidate。
+
+    tags 取自 gradient.suggest_axes（fake 无 agent 回报，用建议近似）；不写 applied.json。
+    """
     base = Path(ctx.run_dir) / "candidates"
     seq = sum(1 for p in base.iterdir() if p.is_dir()) if base.exists() else 0
     cid = make_candidate_id(seq)
     engine_path = Path(candidate_engine_path(ctx.run_dir, cid))
     engine_path.parent.mkdir(parents=True, exist_ok=True)
     engine_path.write_text(code, encoding="utf-8")
-    Path(candidate_policy_path(ctx.run_dir, cid)).write_text(to_json(policy), encoding="utf-8")
     return Candidate(
         id=cid,
-        kind=policy.kind,
-        round=policy.round,
-        parent_id=policy.parent_id,
-        strategy_tags=strategy_tags(policy),
+        kind=gradient.kind,
+        round=gradient.round,
+        parent_id=gradient.parent_id,
+        strategy_tags=strategy_tags(gradient.suggest_axes),
         extra={"fake_passed": passed, "fake_score": score},
     )
 
@@ -100,7 +102,7 @@ def _evaluate_fake(
 
 
 def _stop_analyze(reason: str = "done"):
-    def analyze(state: LoopState, *, llm: Any | None = None) -> Policy | NoMove:
+    def analyze(state: LoopState, *, llm: Any | None = None) -> Gradient | NoMove:
         _ = (state, llm)
         return NoMove(reason)  # analyze 只产 NoMove；停因由总控读取并写 stop_reason
 
@@ -108,11 +110,11 @@ def _stop_analyze(reason: str = "done"):
 
 
 def _scripted_analyze(
-    steps: list[Callable[[LoopState], Policy] | None],
+    steps: list[Callable[[LoopState], Gradient] | None],
     *,
     stop_reason: str = "done",
 ):
-    def analyze(state: LoopState, *, llm: Any | None = None) -> Policy | NoMove:
+    def analyze(state: LoopState, *, llm: Any | None = None) -> Gradient | NoMove:
         _ = llm
         if not steps:
             return _stop_analyze(stop_reason)(state)
@@ -124,15 +126,15 @@ def _scripted_analyze(
     return analyze
 
 
-def _kv_policy(state: LoopState) -> Policy:
-    policy = aggregate(
-        {"kv_cache": "incremental"},
+def _kv_grad(state: LoopState) -> Gradient:
+    gradient = Gradient(
+        suggest_axes={"kv_cache": "incremental"},
         kind="optimization",
         round=state.round + 1,
         parent_id=state.best_id,
         rationale="try kv cache",
-    ).policy
-    # 镜像生产 analyze（grad.py）：每产一个 policy 都发一条 source="analyze" 的 continue 事件，
+    )
+    # 镜像生产 analyze（grad.py）：每产一个 gradient 都发一条 source="analyze" 的 continue 事件，
     # 它是 _reasoning_trace 的逐轮锚（无此事件则该轮不进 rounds[]）。
     state.add_event(
         AgentEvent(
@@ -144,12 +146,12 @@ def _kv_policy(state: LoopState) -> Policy:
                 "used_llm": False,
                 "bottleneck": "kv",
                 "detail": "try kv cache",
-                "next_strategy_tags": strategy_tags(policy),
-                "knobs_delta": {},
+                "suggest_axes": dict(gradient.suggest_axes),
+                "knobs": {},
             },
         )
     )
-    return policy
+    return gradient
 
 
 # === hard_stop_reason（总控硬上限判停，从 analyze 上移） =============
@@ -182,17 +184,17 @@ def test_run_loop_hard_stops_on_max_stale_rounds(tmp_path: Path):
     ctx = _ctx(tmp_path, limits=Limits(max_stale_rounds=1))
 
     def bootstrap(ctx: TaskContext) -> Candidate:
-        return _persist_fake(ctx, default_policy(), "baseline engine", score=1.0)
+        return _persist_fake(ctx, Gradient(kind="baseline"), "baseline engine", score=1.0)
 
     def propose(
-        ctx: TaskContext, policy: Policy, parent_code: str, *, llm: Any | None
+        ctx: TaskContext, gradient: Gradient, parent_code: str, *, llm: Any | None
     ) -> Candidate | None:
         _ = (parent_code, llm)
-        return _persist_fake(ctx, policy, "slower engine", score=0.5)
+        return _persist_fake(ctx, gradient, "slower engine", score=0.5)
 
     hooks = LoopHooks(
         bootstrap=bootstrap,
-        analyze=_scripted_analyze([_kv_policy, _kv_policy, _kv_policy]),
+        analyze=_scripted_analyze([_kv_grad, _kv_grad, _kv_grad]),
         propose=propose,
         evaluate=_evaluate_fake,
     )
@@ -207,9 +209,9 @@ def test_run_loop_c2_stops_on_llm_infra_failure(tmp_path: Path):
     ctx = _ctx(tmp_path)
 
     def bootstrap(ctx: TaskContext) -> Candidate:
-        return _persist_fake(ctx, default_policy(), "baseline engine", score=1.0)
+        return _persist_fake(ctx, Gradient(kind="baseline"), "baseline engine", score=1.0)
 
-    def boom_analyze(state: LoopState, *, llm: Any | None = None) -> Policy | NoMove:
+    def boom_analyze(state: LoopState, *, llm: Any | None = None) -> Gradient | NoMove:
         _ = (state, llm)
         raise LLMCallError("api down")
 
@@ -226,13 +228,13 @@ def test_run_loop_evaluator_c2_stops_and_keeps_published_best(tmp_path: Path):
     ctx = _ctx(tmp_path)
 
     def bootstrap(ctx: TaskContext) -> Candidate:
-        return _persist_fake(ctx, default_policy(), "baseline engine", score=1.0)
+        return _persist_fake(ctx, Gradient(kind="baseline"), "baseline engine", score=1.0)
 
     def propose(
-        ctx: TaskContext, policy: Policy, parent_code: str, *, llm: Any | None
+        ctx: TaskContext, gradient: Gradient, parent_code: str, *, llm: Any | None
     ) -> Candidate | None:
         _ = (parent_code, llm)
-        return _persist_fake(ctx, policy, "optimized engine", score=2.0)
+        return _persist_fake(ctx, gradient, "optimized engine", score=2.0)
 
     calls = {"n": 0}
 
@@ -247,7 +249,7 @@ def test_run_loop_evaluator_c2_stops_and_keeps_published_best(tmp_path: Path):
 
     hooks = LoopHooks(
         bootstrap=bootstrap,
-        analyze=_scripted_analyze([_kv_policy, _kv_policy]),
+        analyze=_scripted_analyze([_kv_grad, _kv_grad]),
         propose=propose,
         evaluate=flaky_eval,
     )
@@ -262,7 +264,7 @@ def test_run_loop_bootstraps_and_publishes_when_analyze_stops(tmp_path: Path):
     ctx = _ctx(tmp_path)
 
     def bootstrap(ctx: TaskContext) -> Candidate:
-        return _persist_fake(ctx, default_policy(), "baseline engine", score=1.0)
+        return _persist_fake(ctx, Gradient(kind="baseline"), "baseline engine", score=1.0)
 
     hooks = LoopHooks(
         bootstrap=bootstrap,
@@ -299,17 +301,17 @@ def test_run_loop_promotes_strictly_better_candidate(tmp_path: Path):
     ctx = _ctx(tmp_path)
 
     def bootstrap(ctx: TaskContext) -> Candidate:
-        return _persist_fake(ctx, default_policy(), "baseline engine", score=1.0)
+        return _persist_fake(ctx, Gradient(kind="baseline"), "baseline engine", score=1.0)
 
     def propose(
-        ctx: TaskContext, policy: Policy, parent_code: str, *, llm: Any | None
+        ctx: TaskContext, gradient: Gradient, parent_code: str, *, llm: Any | None
     ) -> Candidate | None:
         _ = (parent_code, llm)
-        return _persist_fake(ctx, policy, "optimized engine", score=2.0)
+        return _persist_fake(ctx, gradient, "optimized engine", score=2.0)
 
     hooks = LoopHooks(
         bootstrap=bootstrap,
-        analyze=_scripted_analyze([_kv_policy, None]),
+        analyze=_scripted_analyze([_kv_grad, None]),
         propose=propose,
         evaluate=_evaluate_fake,
     )
@@ -337,17 +339,17 @@ def test_run_loop_keeps_best_when_candidate_is_not_better(tmp_path: Path):
     ctx = _ctx(tmp_path)
 
     def bootstrap(ctx: TaskContext) -> Candidate:
-        return _persist_fake(ctx, default_policy(), "baseline engine", score=1.0)
+        return _persist_fake(ctx, Gradient(kind="baseline"), "baseline engine", score=1.0)
 
     def propose(
-        ctx: TaskContext, policy: Policy, parent_code: str, *, llm: Any | None
+        ctx: TaskContext, gradient: Gradient, parent_code: str, *, llm: Any | None
     ) -> Candidate | None:
         _ = (parent_code, llm)
-        return _persist_fake(ctx, policy, "slower engine", score=0.5)
+        return _persist_fake(ctx, gradient, "slower engine", score=0.5)
 
     hooks = LoopHooks(
         bootstrap=bootstrap,
-        analyze=_scripted_analyze([_kv_policy, None]),
+        analyze=_scripted_analyze([_kv_grad, None]),
         propose=propose,
         evaluate=_evaluate_fake,
     )
@@ -364,17 +366,17 @@ def test_output3_records_non_improving_rounds_every_round(tmp_path: Path):
     ctx = _ctx(tmp_path)
 
     def bootstrap(ctx: TaskContext) -> Candidate:
-        return _persist_fake(ctx, default_policy(), "baseline engine", score=1.0)
+        return _persist_fake(ctx, Gradient(kind="baseline"), "baseline engine", score=1.0)
 
     def propose(
-        ctx: TaskContext, policy: Policy, parent_code: str, *, llm: Any | None
+        ctx: TaskContext, gradient: Gradient, parent_code: str, *, llm: Any | None
     ) -> Candidate | None:
         _ = (parent_code, llm)
-        return _persist_fake(ctx, policy, "slower engine", score=0.5)
+        return _persist_fake(ctx, gradient, "slower engine", score=0.5)
 
     hooks = LoopHooks(
         bootstrap=bootstrap,
-        analyze=_scripted_analyze([_kv_policy, _kv_policy, None]),
+        analyze=_scripted_analyze([_kv_grad, _kv_grad, None]),
         propose=propose,
         evaluate=_evaluate_fake,
     )
@@ -400,28 +402,28 @@ def test_run_loop_repairs_failed_candidate_and_promotes_repair(tmp_path: Path):
     ctx = _ctx(tmp_path, limits=Limits(max_repair_retries=1))
 
     def bootstrap(ctx: TaskContext) -> Candidate:
-        return _persist_fake(ctx, default_policy(), "baseline engine", score=1.0)
+        return _persist_fake(ctx, Gradient(kind="baseline"), "baseline engine", score=1.0)
 
     def propose(
-        ctx: TaskContext, policy: Policy, parent_code: str, *, llm: Any | None
+        ctx: TaskContext, gradient: Gradient, parent_code: str, *, llm: Any | None
     ) -> Candidate | None:
         _ = (parent_code, llm)
-        return _persist_fake(ctx, policy, "broken engine", passed=False)
+        return _persist_fake(ctx, gradient, "broken engine", passed=False)
 
     def repair(
         ctx: TaskContext,
-        policy: Policy,
+        gradient: Gradient,
         parent_code: str,
         errors: list[ValidationError],
         *,
         llm: Any | None,
     ) -> Candidate | None:
         _ = (parent_code, errors, llm)
-        return _persist_fake(ctx, policy, "repaired engine", score=2.0)
+        return _persist_fake(ctx, gradient, "repaired engine", score=2.0)
 
     hooks = LoopHooks(
         bootstrap=bootstrap,
-        analyze=_scripted_analyze([_kv_policy, None]),
+        analyze=_scripted_analyze([_kv_grad, None]),
         propose=propose,
         repair=repair,
         evaluate=_evaluate_fake,
@@ -438,7 +440,7 @@ def test_keep_best_publishes_engine_immediately(tmp_path: Path):
 
     ctx = _ctx(tmp_path)
     candidate = _evaluate_fake(
-        _persist_fake(ctx, default_policy(), "first best engine", score=1.0), ctx
+        _persist_fake(ctx, Gradient(kind="baseline"), "first best engine", score=1.0), ctx
     )
     state = LoopState(task_context=ctx)
 
@@ -457,16 +459,18 @@ def test_keep_best_republishes_on_strict_improvement(tmp_path: Path):
     ctx = _ctx(tmp_path)
     state = LoopState(task_context=ctx)
 
-    first = _evaluate_fake(_persist_fake(ctx, default_policy(), "engine v1", score=1.0), ctx)
+    first = _evaluate_fake(
+        _persist_fake(ctx, Gradient(kind="baseline"), "engine v1", score=1.0), ctx
+    )
     keep_best(state, first)
     worse = _evaluate_fake(
-        _persist_fake(ctx, aggregate({}, round=1).policy, "engine worse", score=0.5), ctx
+        _persist_fake(ctx, Gradient(round=1), "engine worse", score=0.5), ctx
     )
     assert keep_best(state, worse) is False
     assert Path(ctx.engine_publish_path).read_text(encoding="utf-8") == "engine v1"
 
     better = _evaluate_fake(
-        _persist_fake(ctx, aggregate({}, round=2).policy, "engine v2", score=2.0), ctx
+        _persist_fake(ctx, Gradient(round=2), "engine v2", score=2.0), ctx
     )
     assert keep_best(state, better) is True
     assert Path(ctx.engine_publish_path).read_text(encoding="utf-8") == "engine v2"
