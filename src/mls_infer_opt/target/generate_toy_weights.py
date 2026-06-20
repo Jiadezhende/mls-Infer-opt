@@ -5,11 +5,11 @@ from pathlib import Path
 import torch
 
 
-def normal(shape, scale=0.02):
+def normal(shape: tuple[int, ...], scale: float = 0.02) -> torch.Tensor:
     return torch.randn(*shape, dtype=torch.float32) * scale
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--output", required=True)
@@ -32,7 +32,7 @@ def main():
     q_out = num_heads * head_dim
     kv_out = num_kv_heads * head_dim
 
-    state = {}
+    state: dict[str, torch.Tensor] = {}
     state["embed_tokens.weight"] = normal((vocab_size, hidden_size))
 
     for layer_idx in range(num_layers):
