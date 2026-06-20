@@ -1,30 +1,27 @@
-"""compat — 策略冲突校验：把非法/无意义的轴组合降级成合法组合。
+"""compat — 轴间依赖约束（声明 + 渲成 prompt 规则文本）。
 
-搜索空间是若干正交轴，但轴之间有真实依赖（合批解码需要 KV 缓存、enable_gqa 需要 SDPA…）。
-LLM / analyze 可能给出冲突组合，渲染前必须先消解，否则会产出跑不起来或语义错误的 engine。
+搜索维度是若干正交轴，但轴之间有真实依赖（合批解码需要 KV 缓存、enable_gqa 需要 SDPA…）。
 
-降级原则：**依赖方让步**。约束形如「轴 X 取某些选项 → 要求轴 Y 取某些选项」，违反时把
-更激进的依赖轴 X 退回它的 baseline 默认（而非反向去开启 Y），因为退回默认恒等价 baseline、
-绝不会引入新风险，且结果对同一输入是决定性的（保证候选 id 可复现）。
+不再做「消解成恒合法定点」：generate 的 agent 在搜索维度界内自由写码，外层 full gate 是唯一权威，
+而这些硬依赖恰是 full gate 的**子集**（跑不起来类被 syntax/runtime 抓、语义冲突类被 allclose 抓）。
+故本模块只保留约束的**声明**，并把它们渲成 prompt 规则文本（``render_constraints``）注入给 analyze
+与 generate 的 LLM，让其尽量自洽；越界的非法组合交 full gate 拦，不再在 Python 里反向降级。
 
-本模块纯逻辑、零依赖（除 space）。输入需是已归一化、键齐全的 axes（见 policy.normalize）。
+本模块纯逻辑、零依赖（除 space）。
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
 
-from .space import AXIS_BY_KEY
-
-__all__ = ["Requires", "Violation", "CONSTRAINTS", "validate", "resolve"]
+__all__ = ["Requires", "CONSTRAINTS", "render_constraints"]
 
 
 @dataclass(frozen=True)
 class Requires:
     """依赖约束：``axes[when_axis] ∈ when_options`` 时要求 ``axes[need_axis] ∈ need_options``。
 
-    违反时降级动作固定为：把 ``when_axis`` 退回其 baseline 默认（依赖方让步）。
+    仅作声明 + 渲成 prompt 规则；不在 Python 里执行降级（交 full gate 拦非法组合）。
     """
 
     name: str
@@ -33,23 +30,6 @@ class Requires:
     need_axis: str
     need_options: tuple[str, ...]
     summary: str = ""
-
-    def is_violated(self, axes: Mapping[str, str]) -> bool:
-        return axes.get(self.when_axis) in self.when_options and (
-            axes.get(self.need_axis) not in self.need_options
-        )
-
-
-@dataclass
-class Violation:
-    """一次冲突命中（供 report / repair 诊断）。"""
-
-    constraint: str
-    summary: str
-    when_axis: str
-    when_value: str
-    need_axis: str
-    fix: str  # 将把 when_axis 退回的默认值
 
 
 # === 约束表 ===========================================================
@@ -109,39 +89,14 @@ CONSTRAINTS: tuple[Requires, ...] = (
 )
 
 
-def validate(axes: Mapping[str, str]) -> list[Violation]:
-    """只检测、不修改，返回全部冲突。axes 需已归一化、键齐全。"""
-    violations: list[Violation] = []
-    for c in CONSTRAINTS:
-        if c.is_violated(axes):
-            violations.append(
-                Violation(
-                    constraint=c.name,
-                    summary=c.summary,
-                    when_axis=c.when_axis,
-                    when_value=axes[c.when_axis],
-                    need_axis=c.need_axis,
-                    fix=AXIS_BY_KEY[c.when_axis].default,
-                )
-            )
-    return violations
+def render_constraints() -> str:
+    """把依赖约束渲成 prompt 规则文本，注入 analyze / generate 的 LLM（让其组合尽量自洽）。
 
-
-def resolve(axes: Mapping[str, str]) -> tuple[dict[str, str], list[str]]:
-    """消解全部冲突，返回 (合法 axes, 降级说明列表)。
-
-    依赖方让步：违反约束的 when_axis 退回 baseline 默认。退回默认不会触发新冲突
-    （约束只在 when_axis 取非默认时命中），故单遍即达不动点；仍迭代到稳定以防新增约束破坏该性质。
+    形如「- 取 X∈{…} 时需 Y∈{…}：<summary>」。非法组合不在此降级，交 full gate 拦。
     """
-    resolved = dict(axes)
-    notes: list[str] = []
-    for _ in range(len(CONSTRAINTS) + 1):
-        hits = validate(resolved)
-        if not hits:
-            break
-        for v in hits:
-            resolved[v.when_axis] = v.fix
-            notes.append(
-                f"{v.constraint}: {v.when_axis}={v.when_value!r} → {v.fix!r}（{v.summary}）"
-            )
-    return resolved, notes
+    lines: list[str] = []
+    for c in CONSTRAINTS:
+        when = " | ".join(c.when_options)
+        need = " | ".join(c.need_options)
+        lines.append(f"- 取 {c.when_axis}∈{{{when}}} 时需 {c.need_axis}∈{{{need}}}：{c.summary}")
+    return "\n".join(lines)

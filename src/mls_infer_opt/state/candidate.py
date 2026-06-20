@@ -23,7 +23,7 @@ __all__ = [
     "make_candidate_id",
     "candidate_dir",
     "candidate_engine_path",
-    "candidate_policy_path",
+    "candidate_applied_path",
     "Candidate",
 ]
 
@@ -53,9 +53,9 @@ def candidate_engine_path(run_dir: str, candidate_id: str) -> str:
     return f"{candidate_dir(run_dir, candidate_id)}/engine.py"
 
 
-def candidate_policy_path(run_dir: str, candidate_id: str) -> str:
-    """候选采用的 policy 落点（审计 / report 用）。"""
-    return f"{candidate_dir(run_dir, candidate_id)}/policy.json"
+def candidate_applied_path(run_dir: str, candidate_id: str) -> str:
+    """候选实际采用记录落点（agent 回报的 applied_axes/knobs + rationale，审计 / report 用）。"""
+    return f"{candidate_dir(run_dir, candidate_id)}/applied.json"
 
 
 @dataclass

@@ -54,10 +54,9 @@ def test_format_data_block_skips_empty_and_renders_whitelist():
         message="继续",
         data={
             "bottleneck": "decode_throughput",
-            "next_strategy_tags": ["attention:paged_kv", "kvcache:fp8"],
+            "suggest_axes": {"attention": "sdpa", "kv_cache": "incremental"},
             "detail": "理由全文",
-            "fixes": "",  # 空值应被跳过
-            "axes_delta": {},  # 空 dict 应被跳过
+            "knobs": {},  # 空 dict 应被跳过
             "round": 2,  # round 不渲染（表头已隐含）
             "best_score": 210.0,
         },
@@ -65,9 +64,9 @@ def test_format_data_block_skips_empty_and_renders_whitelist():
     block = present.format_data_block(ev)
     text = "\n".join(block)
     assert "bottleneck: decode_throughput" in text
-    assert "strategy  : attention:paged_kv, kvcache:fp8" in text
+    assert "strategy  : attention=sdpa, kv_cache=incremental" in text
     assert "rationale : 理由全文" in text
-    assert "fixes" not in text and "axes_delta" not in text
+    assert "knobs" not in text  # 空 knobs 跳过
     assert "situation : best_score=210" in text
     # round 不应单独成行
     assert not any(line.strip().startswith("round") for line in block)

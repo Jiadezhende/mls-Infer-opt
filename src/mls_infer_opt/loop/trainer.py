@@ -30,8 +30,8 @@ from ..llm.errors import LLMError  # 仅 errors（零依赖），避免经 llm/_
 from ..state.candidate import Candidate, candidate_engine_path
 from ..state.context import Environment, Limits, Paths, TaskContext
 from ..state.eval import EvalMode, ValidationError, normalized_speedup_score
+from ..state.gradient import Gradient, NoMove
 from ..state.loop import AgentEvent, EventLevel, LoopState, emit
-from ..state.policy import NoMove, Policy
 
 __all__ = [
     "AnalyzeFn",
@@ -54,12 +54,12 @@ class BootstrapFn(Protocol):
 
 
 class AnalyzeFn(Protocol):
-    def __call__(self, state: LoopState, *, llm: Any | None = None) -> Policy | NoMove: ...
+    def __call__(self, state: LoopState, *, llm: Any | None = None) -> Gradient | NoMove: ...
 
 
 class ProposeFn(Protocol):
     def __call__(
-        self, ctx: TaskContext, policy: Policy, parent_code: str, *, llm: Any | None
+        self, ctx: TaskContext, gradient: Gradient, parent_code: str, *, llm: Any | None
     ) -> Candidate | None: ...
 
 
@@ -67,7 +67,7 @@ class RepairFn(Protocol):
     def __call__(
         self,
         ctx: TaskContext,
-        policy: Policy,
+        gradient: Gradient,
         parent_code: str,
         errors: list[ValidationError],
         *,
@@ -216,16 +216,16 @@ def run_loop(
             _stop(state, result.reason, "analyze 无方向")
             break
 
-        policy = result
+        gradient = result
         try:
-            improved = _run_policy_round(state, policy, llm, hooks, config)
+            improved = _run_policy_round(state, gradient, llm, hooks, config)
         except LLMError as e:  # generate 的 C2 同样穿透到此：C2 停 + 仍发布。
             _stop(state, "llm_infra_failure", f"generate LLM 调用失败：{e}", level="error")
             break
         except EvaluatorInfraError as e:  # evaluate 的 C2 穿透到此：C2 停 + 仍发布。
             _stop(state, "evaluator_infra_failure", f"评测器基建失败：{e}", level="error")
             break
-        state.round = max(state.round, policy.round)
+        state.round = max(state.round, gradient.round)
         if not improved:
             state.stale_rounds += 1
         # 每轮落盘：不止 best 提升时刷 output3，使被 kill 时 rounds[] 含所有已完成轮（叙事抗-kill
@@ -391,7 +391,7 @@ def finalize(
 
 def _run_policy_round(
     state: LoopState,
-    policy: Policy,
+    gradient: Gradient,
     llm: Any | None,
     hooks: LoopHooks,
     config: LoopConfig,
@@ -404,7 +404,7 @@ def _run_policy_round(
 
     present.emit("  · 生成候选中…")  # 瞬态进度：仅 stderr，不落 results.log
     try:
-        candidate = hooks.propose(ctx, policy, parent_code, llm=llm)
+        candidate = hooks.propose(ctx, gradient, parent_code, llm=llm)
     except LLMError:
         raise  # C2 穿透到 run_loop 边界
     except Exception as e:
@@ -417,7 +417,7 @@ def _run_policy_round(
             state,
             "本轮未产出候选" + (f"（{reason}）" if reason else ""),
             "generate",
-            data={"policy_round": policy.round, "parent_id": state.best_id, "reason": reason},
+            data={"policy_round": gradient.round, "parent_id": state.best_id, "reason": reason},
         )
         return False
 
@@ -428,12 +428,12 @@ def _run_policy_round(
         return True
     if candidate.gate is None or candidate.gate.passed:
         return False
-    return _run_repairs(state, policy, candidate, llm, hooks, config)
+    return _run_repairs(state, gradient, candidate, llm, hooks, config)
 
 
 def _run_repairs(
     state: LoopState,
-    policy: Policy,
+    gradient: Gradient,
     failed: Candidate,
     llm: Any | None,
     hooks: LoopHooks,
@@ -450,7 +450,7 @@ def _run_repairs(
         errors = cur.gate.errors if cur.gate is not None else []
         present.emit(f"  · 修复中（第 {attempt} 次）…")  # 瞬态进度：仅 stderr，不落 results.log
         try:
-            repaired = hooks.repair(ctx, policy, parent_code, errors, llm=llm)
+            repaired = hooks.repair(ctx, gradient, parent_code, errors, llm=llm)
         except LLMError:
             raise  # C2 穿透到 run_loop 边界
         except Exception as e:

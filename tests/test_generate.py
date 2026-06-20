@@ -17,10 +17,10 @@ from mls_infer_opt.generate import (
 )
 from mls_infer_opt.generate.codegen import _BASELINE_PATH, _MAX_SELF_CHECK_ROUNDS
 from mls_infer_opt.llm import FakeAgentClient, LLMConfig, LLMError, OpenAIAgentClient
-from mls_infer_opt.searchspace import aggregate, default_policy, merge
 from mls_infer_opt.state.candidate import candidate_dir, candidate_engine_path
 from mls_infer_opt.state.context import Paths, TaskContext
 from mls_infer_opt.state.eval import ValidationError
+from mls_infer_opt.state.gradient import Gradient
 
 SMALL_CONFIG = {
     "num_hidden_layers": 2,
@@ -95,57 +95,46 @@ def _load_engine_module(path: str):
 
 
 # === 1. prompt 渲染（纯逻辑） =========================================
-def test_build_prompt_renders_nondefault_axes_and_knobs():
-    policy = aggregate(
-        {"kv_cache": "incremental", "attention": "sdpa"},
-        {"kv_capacity_init": 256},
+def test_build_prompt_renders_suggestions_menu_and_knobs():
+    gradient = Gradient(
+        suggest_axes={"kv_cache": "incremental", "attention": "sdpa"},
+        knobs={"kv_capacity_init": 256},
         kind="optimization",
         round=1,
         parent_id="r0-aaaa",
-    ).policy
-    text = build_prompt(policy, make_ctx_stub(), mode="propose", parent_code="# parent")
+    )
+    text = build_prompt(gradient, make_ctx_stub(), mode="propose", parent_code="# parent")
 
+    # analyze 松建议渲成清单
     assert "kv_cache = incremental" in text
     assert "attention = sdpa" in text
-    assert "kv_capacity_init=256" in text  # 激活轴的 knob 值被注入
-    # 默认轴不出现（norm 默认是 rmsnorm_fp32）
-    assert "norm = rmsnorm_fp32" not in text
+    assert "kv_capacity_init=256" in text  # 配套 knob 建议值
+    # 完整搜索维度（界）+ 依赖规则在场，供 agent 自由探索
+    assert "可探索的搜索维度" in text and "torch_compile" in text
+    assert "轴间依赖" in text
     # 契约稳定知识在场
     assert "create_engine" in text and "allclose" in text
 
 
-def test_build_prompt_renders_policy_rationale_in_propose():
-    policy = aggregate(
-        {"attention": "sdpa"},
+def test_build_prompt_renders_rationale_in_propose():
+    gradient = Gradient(
+        suggest_axes={"attention": "sdpa"},
         kind="optimization",
         round=1,
         parent_id="r0-base",
         rationale="decode 是瓶颈：合批后注意力仍是 O(n²)，优先上 SDPA。",
-    ).policy
-    text = build_prompt(policy, make_ctx_stub(), mode="propose", parent_code="# parent")
+    )
+    text = build_prompt(gradient, make_ctx_stub(), mode="propose", parent_code="# parent")
     assert "analyze 方向提示" in text
     assert "decode 是瓶颈" in text
 
 
-def test_merge_overlays_delta_and_carries_rationale():
-    parent = aggregate({"attention": "sdpa"}, parent_id="r0-base").policy
-    child = merge(
-        parent,
-        axes_delta={"kv_cache": "incremental"},
-        kind="optimization",
-        round=2,
-        parent_id="r1-base",
-        rationale="加 KV cache 去掉重算。",
-    ).policy
-    # parent 的轴被继承，delta 叠加，结果合法
-    assert child.axes["attention"] == "sdpa"
-    assert child.axes["kv_cache"] == "incremental"
-    assert child.rationale == "加 KV cache 去掉重算。"
-    assert child.round == 2 and child.parent_id == "r1-base"
+def test_build_prompt_empty_suggestions_says_free_explore():
+    text = build_prompt(Gradient(), make_ctx_stub(), mode="propose", parent_code="# parent")
+    assert "无具体建议" in text  # 空建议 → 明确放手在维度界内自由探索
 
 
 def test_build_prompt_repair_includes_validation_error():
-    policy = default_policy()
     err = ValidationError(
         stage="correctness",
         message="logits mismatch on decode",
@@ -154,7 +143,9 @@ def test_build_prompt_repair_includes_validation_error():
         expected_shape=[2, 100],
         actual_shape=[2, 100],
     )
-    text = build_prompt(policy, make_ctx_stub(), mode="repair", parent_code="# bad", errors=[err])
+    text = build_prompt(
+        Gradient(kind="repair"), make_ctx_stub(), mode="repair", parent_code="# bad", errors=[err]
+    )
     assert "logits mismatch on decode" in text
     assert "multi_decode" in text
     assert "待修复" in text
@@ -215,18 +206,22 @@ def test_bootstrap_engine_runs(tmp_path):
 
 
 # === 4. propose/repair 编排兜底（模型只回文本、没调工具 → 抽码 + 确定性复核的回退路径） ===
+def _opt_grad(**kw) -> Gradient:
+    base = dict(suggest_axes={"attention": "sdpa"}, kind="optimization", round=1,
+                parent_id="r0-base")
+    base.update(kw)
+    return Gradient(**base)
+
+
 def test_propose_persists_candidate_on_good_llm(tmp_path):
     ctx = make_ctx(tmp_path)
-    policy = aggregate(
-        {"attention": "sdpa"}, kind="optimization", round=1, parent_id="r0-base"
-    ).policy
     llm = FakeAgentClient([f"好的：\n```python\n{BASELINE_CODE}\n```\n完成"])
 
-    cand = propose(ctx, policy, parent_code=BASELINE_CODE, llm=llm)
+    cand = propose(ctx, _opt_grad(), parent_code=BASELINE_CODE, llm=llm)
     assert cand is not None
     assert cand.kind == "optimization"
     assert cand.parent_id == "r0-base"
-    # honest tags：回退文本路径无 agent 采用回报 → 空 tags（不再照 policy 的 sdpa 撒谎）。
+    # honest tags：回退文本路径无 agent 采用回报 → 空 tags（不再照 gradient 的 sdpa 撒谎）。
     assert cand.strategy_tags == []
     # 真落盘
     import os
@@ -235,56 +230,49 @@ def test_propose_persists_candidate_on_good_llm(tmp_path):
 
 def test_propose_returns_none_on_garbage(tmp_path):
     ctx = make_ctx(tmp_path)
-    policy = default_policy()
     llm = FakeAgentClient(["no code here at all"])
-    assert propose(ctx, policy, parent_code=BASELINE_CODE, llm=llm) is None
+    assert propose(ctx, Gradient(), parent_code=BASELINE_CODE, llm=llm) is None
 
 
 def test_propose_returns_none_on_llm_exception(tmp_path):
     ctx = make_ctx(tmp_path)
-    policy = default_policy()
     llm = FakeAgentClient([RuntimeError("boom")])
-    assert propose(ctx, policy, parent_code=BASELINE_CODE, llm=llm) is None
+    assert propose(ctx, Gradient(), parent_code=BASELINE_CODE, llm=llm) is None
 
 
 def test_propose_returns_none_when_unavailable(tmp_path):
     ctx = make_ctx(tmp_path)
-    policy = default_policy()
     down = FakeAgentClient([], available=False)
-    assert propose(ctx, policy, parent_code=BASELINE_CODE, llm=down) is None
-    assert propose(ctx, policy, parent_code=BASELINE_CODE, llm=None) is None
+    assert propose(ctx, Gradient(), parent_code=BASELINE_CODE, llm=down) is None
+    assert propose(ctx, Gradient(), parent_code=BASELINE_CODE, llm=None) is None
 
 
 def test_repair_persists_candidate(tmp_path):
     ctx = make_ctx(tmp_path)
-    policy = aggregate({}, kind="repair", round=2, parent_id="r1-bbbb").policy
+    gradient = Gradient(kind="repair", round=2, parent_id="r1-bbbb")
     err = ValidationError(stage="syntax", message="unexpected indent")
     llm = FakeAgentClient([f"```python\n{BASELINE_CODE}\n```"])
-    cand = repair(ctx, policy, parent_code=BASELINE_CODE, errors=[err], llm=llm)
+    cand = repair(ctx, gradient, parent_code=BASELINE_CODE, errors=[err], llm=llm)
     assert cand is not None and cand.kind == "repair"
 
 
 def test_propose_accepts_agent_client_interface(tmp_path):
     ctx = make_ctx(tmp_path)
-    policy = aggregate(
-        {"attention": "sdpa"}, kind="optimization", round=1, parent_id="r0-base"
-    ).policy
     llm = FakeAgentClient([f"```python\n{BASELINE_CODE}\n```"])
 
-    cand = propose(ctx, policy, parent_code=BASELINE_CODE, llm=llm)
+    cand = propose(ctx, _opt_grad(), parent_code=BASELINE_CODE, llm=llm)
     assert cand is not None
     assert cand.kind == "optimization"
-    assert llm.prompts and "attention = sdpa" in llm.prompts[0]
+    assert llm.prompts and "attention = sdpa" in llm.prompts[0]  # 松建议渲进 prompt
 
 
-# === 5. Policy 下沉 state =============================================
-def test_policy_dataclass_lives_in_state():
-    from mls_infer_opt.searchspace import Policy as SearchspacePolicy
-    from mls_infer_opt.state import Policy as StatePolicy
+# === 5. Gradient 契约在 state =========================================
+def test_gradient_dataclass_lives_in_state():
+    from mls_infer_opt.state import Gradient as StateGradient
 
-    # searchspace 仅 re-export，类型真身在 state（analyze 不必 import generate 即可产 Policy）。
-    assert SearchspacePolicy is StatePolicy
-    assert StatePolicy.__module__ == "mls_infer_opt.state.policy"
+    # 契约真身在 state（analyze 不必 import generate 即可产 Gradient）。
+    assert StateGradient is Gradient
+    assert StateGradient.__module__ == "mls_infer_opt.state.gradient"
 
 
 # === 6. agent 工具自检自闭环（真 OpenAIAgentClient + 脚本化 Responses；需 torch + 权重）====
@@ -346,12 +334,9 @@ def _agent_client(outputs) -> tuple[OpenAIAgentClient, _FakeOpenAI]:
 def test_propose_agent_loop_degrades_without_weights(tmp_path):
     """无 model.pt → check_engine 静态过即放行（quick 跳过）→ 出候选；落盘码即 agent 提交码。"""
     ctx = make_ctx(tmp_path)  # 不写权重
-    policy = aggregate(
-        {"attention": "sdpa"}, kind="optimization", round=1, parent_id="r0-base"
-    ).policy
     llm, fake = _agent_client([_check_engine_call(BASELINE_CODE), _final_message()])
 
-    cand = propose(ctx, policy, parent_code=BASELINE_CODE, llm=llm)
+    cand = propose(ctx, _opt_grad(), parent_code=BASELINE_CODE, llm=llm)
     assert cand is not None and cand.kind == "optimization"
     persisted = Path(candidate_engine_path(ctx.run_dir, cand.id)).read_text(encoding="utf-8")
     assert persisted == BASELINE_CODE  # 持久化「过 check_engine 的码」
@@ -368,10 +353,7 @@ def _read_applied(ctx: TaskContext, cand_id: str) -> dict:
 def test_propose_agent_report_drives_honest_tags(tmp_path):
     """agent 过门时回报 applied_axes/knobs → strategy_tags 取自回报（过词表闸），与 policy 无关。"""
     ctx = make_ctx(tmp_path)  # 无权重 → 静态过即捕获回报
-    # policy 下发 attention=sdpa，但 agent 自述实际只动了 kv_cache（且夹带一个非法轴 bogus）。
-    policy = aggregate(
-        {"attention": "sdpa"}, kind="optimization", parent_id="r0-base"
-    ).policy
+    # gradient 建议 attention=sdpa，但 agent 自述实际只动了 kv_cache（且夹带一个非法轴 bogus）。
     llm, _ = _agent_client(
         [
             _check_engine_call(
@@ -383,26 +365,24 @@ def test_propose_agent_report_drives_honest_tags(tmp_path):
         ]
     )
 
-    cand = propose(ctx, policy, parent_code=BASELINE_CODE, llm=llm)
+    cand = propose(ctx, _opt_grad(), parent_code=BASELINE_CODE, llm=llm)
     assert cand is not None
-    # honest：tags 来自 agent 回报、过 sanitize（bogus 被丢），不再来自 policy 的 attention:sdpa。
+    # honest：tags 来自 agent 回报、过 sanitize（bogus 被丢），不再来自 gradient 的 attention:sdpa。
     assert cand.strategy_tags == ["kv_cache:incremental"]
     assert "attention:sdpa" not in cand.strategy_tags
-    # applied.json 留档实际采用（axes 已过词表闸，knobs 原样）。
+    # applied.json 留档实际采用（axes 已过词表闸，knobs 原样）；不再写 policy.json（定点已删）。
     applied = _read_applied(ctx, cand.id)
     assert applied["applied_axes"] == {"kv_cache": "incremental"}
     assert applied["applied_knobs"] == {"kv_capacity_init": 128}
+    assert not Path(f"{candidate_dir(ctx.run_dir, cand.id)}/policy.json").exists()
 
 
 def test_propose_agent_no_report_yields_empty_tags(tmp_path):
-    """agent 过门但没回报 applied_axes → 空 tags（诚实「未报」），不照 policy 撒谎。"""
+    """agent 过门但没回报 applied_axes → 空 tags（诚实「未报」），不照 gradient 撒谎。"""
     ctx = make_ctx(tmp_path)
-    policy = aggregate(
-        {"attention": "sdpa"}, kind="optimization", parent_id="r0-base"
-    ).policy
     llm, _ = _agent_client([_check_engine_call(BASELINE_CODE), _final_message()])
 
-    cand = propose(ctx, policy, parent_code=BASELINE_CODE, llm=llm)
+    cand = propose(ctx, _opt_grad(), parent_code=BASELINE_CODE, llm=llm)
     assert cand is not None
     assert cand.strategy_tags == []
     assert _read_applied(ctx, cand.id)["applied_axes"] == {}
@@ -413,10 +393,9 @@ def test_propose_agent_loop_passes_quick_gate_with_weights(tmp_path):
     pytest.importorskip("torch")
     ctx = make_ctx(tmp_path)
     _write_toy_weights(ctx)
-    policy = aggregate({"attention": "sdpa"}, kind="optimization", parent_id="r0-base").policy
     llm, _ = _agent_client([_check_engine_call(BASELINE_CODE), _final_message()])
 
-    cand = propose(ctx, policy, parent_code=BASELINE_CODE, llm=llm)
+    cand = propose(ctx, _opt_grad(), parent_code=BASELINE_CODE, llm=llm)
     assert cand is not None and cand.kind == "optimization"
 
 
@@ -425,13 +404,12 @@ def test_propose_agent_loop_retries_then_fixes_on_error(tmp_path):
     pytest.importorskip("torch")
     ctx = make_ctx(tmp_path)
     _write_toy_weights(ctx)
-    policy = aggregate({"attention": "sdpa"}, kind="optimization", parent_id="r0-base").policy
     bad = "import mls_infer_opt\n" + BASELINE_CODE  # forbidden import → 静态不过、不写 captured
     llm, fake = _agent_client(
         [_check_engine_call(bad, "c1"), _check_engine_call(BASELINE_CODE, "c2"), _final_message()]
     )
 
-    cand = propose(ctx, policy, parent_code=BASELINE_CODE, llm=llm)
+    cand = propose(ctx, _opt_grad(), parent_code=BASELINE_CODE, llm=llm)
     assert cand is not None
     persisted = Path(candidate_engine_path(ctx.run_dir, cand.id)).read_text(encoding="utf-8")
     assert persisted == BASELINE_CODE and "import mls_infer_opt" not in persisted  # captured-wins
@@ -441,21 +419,19 @@ def test_propose_agent_loop_retries_then_fixes_on_error(tmp_path):
 def test_propose_propagates_c2_on_create_exception(tmp_path):
     """create 抛错 = C2 传输失败 → run_agent raise LLMCallError → propose 穿透（不吞）。"""
     ctx = make_ctx(tmp_path)
-    policy = default_policy()
     llm, _ = _agent_client([RuntimeError("net")])
 
     with pytest.raises(LLMError):
-        propose(ctx, policy, parent_code=BASELINE_CODE, llm=llm)
+        propose(ctx, Gradient(), parent_code=BASELINE_CODE, llm=llm)
 
 
 def test_propose_agent_loop_returns_none_when_never_passes(tmp_path):
     """恒提交静态不过的码 → 触顶 max_tool_rounds、ok=False → None（这轮无收益）。"""
     ctx = make_ctx(tmp_path)
-    policy = default_policy()
     bad = "import mls_infer_opt\nthis is not valid python ："
     # max_tool_rounds=_MAX_SELF_CHECK_ROUNDS → 客户端最多 rounds+1 次 create
     outputs = [_check_engine_call(bad, f"c{i}") for i in range(_MAX_SELF_CHECK_ROUNDS + 1)]
     llm, fake = _agent_client(outputs)
 
-    assert propose(ctx, policy, parent_code=BASELINE_CODE, llm=llm) is None
+    assert propose(ctx, Gradient(), parent_code=BASELINE_CODE, llm=llm) is None
     assert len(fake.responses.calls) == _MAX_SELF_CHECK_ROUNDS + 1  # 触顶自检预算

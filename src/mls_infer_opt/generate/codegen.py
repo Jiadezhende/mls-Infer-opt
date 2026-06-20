@@ -3,7 +3,7 @@
 三个入口本质同一件事，差别只在 prompt 与是否用 LLM：
 
 - ``bootstrap``：不依赖 LLM，直接落 pristine baseline 源码——永久兜底、零风险、必产 Candidate。
-- ``propose``：按 Policy（带 analyze 的 rationale）产新候选（LLM）。
+- ``propose``：按 Gradient（analyze 的松建议 + rationale）产新候选（LLM）。
 - ``repair``：按结构化报错定向修复候选（LLM）。
 
 propose/repair 不是「调一次」：把 ``check_engine`` 工具（包 ``check_self_contained`` 静态 +
@@ -16,7 +16,7 @@ check_engine 的码」，挂到 candidate.gate 的只有外层 loop 跑的 full 
 无权重无法自检时优雅降级为「静态过即出候选」。
 
 不变量：本模块只产候选、无发布权；**LLM 不可用 / 失败 / 产垃圾 / 自检始终不过 → 返回 None**
-（loop 当作「这轮没收益」走兜底），绝不抛异常给上层。成功则把 engine.py + policy.json 落到
+（loop 当作「这轮没收益」走兜底），绝不抛异常给上层。成功则把 engine.py + applied.json 落到
 候选工作目录并返回 [Candidate]，code 不进 struct（见 state.candidate）。
 """
 
@@ -36,22 +36,16 @@ from ..evaluate import quick_gate
 # openai_client→present 的导入环。
 from ..llm.errors import LLMError
 from ..llm.tooling import ToolResult, ToolSpec
-from ..searchspace.policy import (
-    Policy,
-    default_policy,
-    sanitize_axes,
-    to_json,
-)
-from ..searchspace.space import AXIS_BY_KEY
+from ..searchspace.dims import sanitize_axes, strategy_tags
 from ..state.candidate import (
     Candidate,
-    candidate_dir,
+    candidate_applied_path,
     candidate_engine_path,
-    candidate_policy_path,
     make_candidate_id,
 )
 from ..state.context import TaskContext
 from ..state.eval import GateResult, ValidationError
+from ..state.gradient import Gradient
 from .prompt import PromptMode, build_prompt
 
 __all__ = [
@@ -143,36 +137,38 @@ def bootstrap(ctx: TaskContext) -> Candidate:
     if problems:  # 自带基线不自包含属开发期 bug，应当场暴露（这是兜底基石）。
         raise RuntimeError(f"baseline asset failed self-containment: {problems}")
     # baseline 即全默认轴：无「采用的非默认轴」→ 空 tags（诚实）。
-    return _persist(ctx, default_policy(), code, applied_axes={}, applied_knobs={})
+    return _persist(
+        ctx, Gradient(kind="baseline"), code, applied_axes={}, applied_knobs={}
+    )
 
 
 def propose(
     ctx: TaskContext,
-    policy: Policy,
+    gradient: Gradient,
     parent_code: str,
     *,
     llm: LLMClient | None,
 ) -> Candidate | None:
-    """按 Policy（含 analyze 的 rationale）产新候选；任何失败返回 None。"""
-    return _generate(ctx, policy, parent_code, mode="propose", llm=llm, errors=None)
+    """按 Gradient（含 analyze 的松建议 + rationale）产新候选；任何失败返回 None。"""
+    return _generate(ctx, gradient, parent_code, mode="propose", llm=llm, errors=None)
 
 
 def repair(
     ctx: TaskContext,
-    policy: Policy,
+    gradient: Gradient,
     parent_code: str,
     errors: list[ValidationError],
     *,
     llm: LLMClient | None,
 ) -> Candidate | None:
     """按结构化报错定向修复候选；任何失败返回 None。"""
-    return _generate(ctx, policy, parent_code, mode="repair", llm=llm, errors=errors)
+    return _generate(ctx, gradient, parent_code, mode="repair", llm=llm, errors=errors)
 
 
 # === 内部流程 =========================================================
 def _generate(
     ctx: TaskContext,
-    policy: Policy,
+    gradient: Gradient,
     parent_code: str,
     *,
     mode: str,
@@ -198,7 +194,7 @@ def _generate(
     try:
         return _generate_agent_loop(
             ctx,
-            policy,
+            gradient,
             parent_code,
             mode=prompt_mode,
             llm=llm,
@@ -215,7 +211,7 @@ def _generate(
 
 def _generate_agent_loop(
     ctx: TaskContext,
-    policy: Policy,
+    gradient: Gradient,
     parent_code: str,
     *,
     mode: PromptMode,
@@ -224,7 +220,7 @@ def _generate_agent_loop(
     max_self_check_rounds: int,
 ) -> Candidate | None:
     """agent 持有 check_engine 工具、内部边写边自检；返回过门候选或 None。"""
-    prompt = build_prompt(policy, ctx, mode=mode, parent_code=parent_code, errors=errors)
+    prompt = build_prompt(gradient, ctx, mode=mode, parent_code=parent_code, errors=errors)
     captured: dict[str, Any] = {}
     tool = _build_check_engine_tool(ctx, captured)
     result = llm.run_agent(
@@ -238,7 +234,7 @@ def _generate_agent_loop(
     if isinstance(code, str):  # agent 已让 check_engine 返回 passed → 该码即已验证
         return _persist(
             ctx,
-            policy,
+            gradient,
             code,
             applied_axes=captured.get("applied_axes", {}),
             applied_knobs=captured.get("applied_knobs", {}),
@@ -252,7 +248,7 @@ def _generate_agent_loop(
         return None
     gate = _quick_self_check(ctx, code)
     if gate is None or gate.passed:
-        return _persist(ctx, policy, code, applied_axes={}, applied_knobs={})
+        return _persist(ctx, gradient, code, applied_axes={}, applied_knobs={})
     return None
 
 
@@ -381,55 +377,42 @@ def _next_seq(run_dir: str) -> int:
 
 def _persist(
     ctx: TaskContext,
-    policy: Policy,
+    gradient: Gradient,
     code: str,
     *,
     applied_axes: Mapping[str, str],
     applied_knobs: Mapping[str, Any],
 ) -> Candidate:
-    """落盘候选工作目录（engine.py + policy.json + applied.json），分配序号 id，返回 Candidate。
+    """落盘候选工作目录（engine.py + applied.json），分配序号 id，返回 Candidate。
 
-    ``strategy_tags`` 取自 agent **实际回报**的 applied_axes（过 ``sanitize_axes`` 词表闸），
-    不再来自 analyze 下发、无人遵守的 policy 定点——这是 honest tags 的咽喉点。applied.json 留档
-    agent 自述的实际采用（axes + knobs），供审计。policy.json 仍留（PR-A 不删定点）。
+    ``strategy_tags`` 取自 agent **实际回报**的 applied_axes（过 ``sanitize_axes`` 词表闸 +
+    strategy_tags 去默认）——不再来自 analyze 下发、无人遵守的定点，这是 honest tags 的咽喉点。
+    applied.json 留档 agent 自述的实际采用（axes + knobs）+ 本轮 rationale，供审计。不再写
+    policy.json（已无恒合法定点）；血缘 kind/round/parent_id 取自 Gradient。
     """
     run_dir = ctx.run_dir
     cid = make_candidate_id(_next_seq(run_dir))
     engine_path = candidate_engine_path(run_dir, cid)
     os.makedirs(os.path.dirname(engine_path), exist_ok=True)
     Path(engine_path).write_text(code, encoding="utf-8")
-    Path(candidate_policy_path(run_dir, cid)).write_text(to_json(policy), encoding="utf-8")
 
     applied = sanitize_axes(applied_axes)
-    tags = _applied_tags(applied)
-    Path(f"{candidate_dir(run_dir, cid)}/applied.json").write_text(
+    tags = strategy_tags(applied)
+    Path(candidate_applied_path(run_dir, cid)).write_text(
         json.dumps(
             {"applied_axes": applied, "applied_knobs": dict(applied_knobs),
-             "rationale": policy.rationale},
+             "rationale": gradient.rationale},
             sort_keys=True, ensure_ascii=False, indent=2,
         ),
         encoding="utf-8",
     )
     return Candidate(
         id=cid,
-        kind=policy.kind,
-        round=policy.round,
-        parent_id=policy.parent_id,
+        kind=gradient.kind,
+        round=gradient.round,
+        parent_id=gradient.parent_id,
         strategy_tags=tags,
     )
-
-
-def _applied_tags(applied: Mapping[str, str]) -> list[str]:
-    """把已过词表闸的实际采用 axes 渲成 ``axis:option`` tags：只列非默认轴，按 AXES 声明顺序。
-
-    与 searchspace.strategy_tags 同口径，但吃 axes dict（PR-A 阶段 strategy_tags 仍吃 Policy，
-    故此处内联；PR-B 会把 strategy_tags 统一收为吃 axes dict）。
-    """
-    return [
-        f"{key}:{applied[key]}"
-        for key in AXIS_BY_KEY
-        if key in applied and applied[key] != AXIS_BY_KEY[key].default
-    ]
 
 
 def check_self_contained(code: str) -> list[str]:

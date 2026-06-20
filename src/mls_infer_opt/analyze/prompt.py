@@ -1,78 +1,41 @@
-"""prompt — 把当前态势拼成喂 LLM 的诊断提示词 + 把回复解析成 Decision（无副作用、无 LLM 调用）。
+"""prompt — 把当前态势拼成喂 LLM 的诊断提示词 + 把回复解析成 Gradient（无副作用、无 LLM 调用）。
 
 analyze 的 LLM 用法刻意对齐 generate（见 [[agentic-generate]]）：**单次调用 + 确定性解析**，
-不依赖 function-calling / tool-loop。LLM 看「搜索空间菜单 + 当前 best + 历史/失败 + 预算」，
-回一个 ```json 决策块；解析失败就回 None，由 grad 重试一次、仍失败则 NoMove。
+不依赖 function-calling / tool-loop。LLM 看「搜索维度菜单 + 依赖规则 + 当前 best + 历史/失败 +
+预算」，回一个 ```json 决策块；解析失败就回 None，由 grad 重试一次、仍失败则 NoMove。
 
-本模块只拼字符串 / 抽 json，并定义解析产物 ``Decision``（LLM 是 analyze 唯一方向源，
-``Decision`` 只由 ``parse_decision`` 产出）；真正的 LLM 调用、判停执行、merge 出 Policy、
-发事件都在 grad.py。
+本模块只拼字符串 / 抽 json，并把回复解析成 ``Gradient``（迈出的一步）或 ``NoMove``（gradient≈0）；
+真正的 LLM 调用、判停执行、发事件都在 grad.py。Gradient 是 analyze↔generate 的共享契约（state 层）。
+``suggest_axes`` 是相对 best 的**松建议**、已过词表闸——不定点，generate 的 agent 在界内自由探索。
 """
 
 from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any
 
-from ..searchspace.policy import grouped_axes
-from ..searchspace.space import AXES, GROUP_ORDER
+from ..searchspace.compat import render_constraints
+from ..searchspace.dims import grouped_axes, render_search_dims, sanitize_axes
+from ..searchspace.space import GROUP_ORDER
 from ..state.eval import BenchResult, ValidationError
-from ..state.policy import Policy
+from ..state.gradient import Gradient, NoMove
 from .situation import Situation
 
 __all__ = [
-    "Action",
-    "Decision",
     "ANALYZE_CONTRACT",
-    "render_search_space",
     "build_analyze_prompt",
-    "parse_decision",
+    "parse_gradient",
 ]
-
-Action = Literal["continue", "stop"]
-
-
-@dataclass
-class Decision:
-    """analyze 单轮决策（LLM 回复的解析产物）。grad 据此 merge 出 Policy 或判停。
-
-    ``action="continue"`` 时看 ``axes_delta``/``knobs_delta``/``rationale``/``bottleneck``；
-    ``action="stop"`` 时看 ``stop_reason``。两者都可带 ``bottleneck``（记进事件）。
-    """
-
-    action: Action = "continue"
-    axes_delta: dict[str, str] = field(default_factory=dict)
-    knobs_delta: dict[str, Any] = field(default_factory=dict)
-    rationale: str = ""
-    bottleneck: str = ""
-    stop_reason: str = ""
 
 
 _FENCE = re.compile(r"```(?:json)?\s*\n(.*?)```", re.DOTALL)
 
 
-def render_search_space() -> str:
-    """把搜索空间渲成菜单：按组件分层列轴/选项/敏感度/knob，供 LLM 选下一步。"""
-    lines: list[str] = []
-    by_group: dict[str, list[str]] = {g: [] for g in GROUP_ORDER}
-    for ax in AXES:
-        risk = "🔴数值敏感" if ax.sensitive else "🟢结构等价"
-        opts = " | ".join(ax.options)
-        knob_list = ", ".join(f"{k.key}(默认{k.default})" for k in ax.knobs)
-        knobs = f"；knobs：{knob_list}" if ax.knobs else ""
-        by_group[ax.group].append(f"  - {ax.key} [{risk}]：{opts}。{ax.summary}{knobs}")
-    for group in GROUP_ORDER:
-        lines.append(f"### {group}")
-        lines.extend(by_group[group])
-    return "\n".join(lines)
-
-
 # 注入每个诊断 prompt 的稳定知识（措辞稳定，利于缓存 / 审计 diff）。
 ANALYZE_CONTRACT = f"""\
 你是一个推理引擎自动调优器的 **grad（梯度）**：看本轮评测反馈与历史，定位瓶颈，从当前最优
-（best）出发做**局部搜索**，给出下一步该动哪条/哪几条轴，或判断应当停止。
+（best）出发做**局部搜索**，给出下一步该往哪些轴探索（松建议），或判断应当停止。
 
 ## 评分口径（grader 实际怎么打分）
 grader 逐 case 报两列：**整体 tokens/s**=(prefill+decode)/elapsed 与 **decode tokens/s**=
@@ -83,26 +46,28 @@ decode/elapsed，外加峰值显存；**不公布合成权重**。含一个纯 p
 - 显存目前只观测、不直接扣分，但别盲目拿显存换速度。
 故方向上**整体吞吐与 decode 吞吐都要顾**，不要只盯单一指标。
 
-## 优化主线先验（搜索空间的方向）
+## 优化主线先验（搜索维度的方向）
 baseline 每步 decode 重算整段（O(n²)）→ 增量 KV 缓存收益最大 → batched prefill / GQA / 合理
-dtype / 显存复用 / SDPA /（视设备）torch.compile。前置依赖：合批解码需 KV 缓存、enable_gqa 需
-SDPA、qkv/mlp 融合需 weight_layout=fused。数值敏感(🔴)轴可能顶破 allclose 容差，谨慎、靠后用。
+dtype / 显存复用 / SDPA /（视设备）torch.compile。数值敏感(🔴)轴可能顶破 allclose 容差，谨慎靠后。
 
-## 可动的搜索空间（轴 → 选项；只能在这些轴上选选项，knob 只属 Policy.knobs，绝不碰模型结构）
-{render_search_space()}
+## 可探索的搜索维度（轴 → 选项；建议只在这些轴上选选项，knob 配套给）
+{render_search_dims()}
+
+## 轴间依赖（尽量自洽；非法组合会被外层 full gate 拦下，不在此自动降级）
+{render_constraints()}
 
 ## 输出格式（只输出一个 ```json 代码块，不要额外解释）
 ```json
 {{
   "action": "continue" 或 "stop",
   "stop_reason": "若 stop，给简短英文 slug，如 target_reached / diminishing_returns",
-  "axes_delta": {{"轴名": "选项名"}},      // 相对 best 要改动的轴（continue 时）
-  "knobs_delta": {{"knob名": 值}},         // 可空；只对被激活轴的 knob 生效
+  "suggest_axes": {{"轴名": "选项名"}},   // 相对 best 建议探索的轴；可空=放手让生成器定
+  "knobs": {{"knob名": 值}},              // 可空；配套被建议轴的 knob
   "rationale": "给 generate 的方向提示：瓶颈/思路/注意点（自然语言，会渲进生成 prompt）",
   "bottleneck": "一句话当前最该解决的问题"
 }}
 ```
-只改动确有把握的少数轴；冲突/非法组合会被自动降级，但应尽量自洽。"""
+只建议确有把握的少数轴；最终采用哪些由生成器在维度界内自定，无需强求一一落实。"""
 
 
 def _fmt_bench(b: BenchResult | None) -> str:
@@ -134,18 +99,19 @@ def _fmt_failure(e: ValidationError) -> str:
     return " ".join(bits)
 
 
-def _fmt_best_axes(policy: Policy) -> str:
-    groups = grouped_axes(policy)
+def _fmt_best_axes(axes: dict[str, str]) -> str:
+    """best 已应用的非默认轴（来自 honest strategy_tags 还原，见 situation.best_axes）。"""
+    groups = grouped_axes(axes)
     items = [f"{axis}={opt}" for group in GROUP_ORDER for axis, opt in groups[group].items()]
     return ", ".join(items) if items else "（全 baseline 默认）"
 
 
-def build_analyze_prompt(sit: Situation, best_policy: Policy) -> str:
+def build_analyze_prompt(sit: Situation) -> str:
     """拼出完整诊断 prompt：契约 + 当前 best + 历史/失败 + 预算态势。"""
     parts: list[str] = [ANALYZE_CONTRACT, ""]
 
     parts.append(f"## 当前态势（第 {sit.round} 轮）")
-    parts.append(f"- best 已应用轴：{_fmt_best_axes(best_policy)}")
+    parts.append(f"- best 已应用轴：{_fmt_best_axes(sit.best_axes)}")
     parts.append(f"- best 性能：{_fmt_bench(sit.best_bench)}")
     parts.append(
         f"- 进度：候选 {sit.n_candidates} 个（拒 {sit.n_rejected}），"
@@ -175,10 +141,12 @@ def build_analyze_prompt(sit: Situation, best_policy: Policy) -> str:
     return "\n".join(parts)
 
 
-def parse_decision(text: str | None) -> Decision | None:
-    """从 LLM 回复抽取 ```json 决策块并解析成 Decision；任何不合规都返回 None（交 grad 重试/判停）。
+def parse_gradient(text: str | None) -> Gradient | NoMove | None:
+    """从 LLM 回复抽 ```json 块 → ``Gradient``（continue）/ ``NoMove``（stop）/ ``None``（不合规）。
 
-    防御式：先取围栏内 json，无围栏则整段试解析；字段缺省走 Decision 默认，类型不对则丢弃该字段。
+    防御式：先取围栏内 json，无围栏则整段试解析。``action=="stop"`` → NoMove(stop_reason)；否则
+    Gradient——``suggest_axes`` 过词表闸 sanitize（丢未知/非法，可空），其余字段缺省走默认。
+    None 表示内容失败，交 grad 重试 / 判 NoMove；round/parent_id/kind 由 grad 据态势补全。
     """
     if not text:
         return None
@@ -191,16 +159,20 @@ def parse_decision(text: str | None) -> Decision | None:
     if not isinstance(data, dict):
         return None
 
-    action: Action = "stop" if data.get("action") == "stop" else "continue"
-    axes_delta = data.get("axes_delta")
-    knobs_delta = data.get("knobs_delta")
-    return Decision(
-        action=action,
-        axes_delta={str(k): str(v) for k, v in axes_delta.items()}
-        if isinstance(axes_delta, dict)
-        else {},
-        knobs_delta=dict(knobs_delta) if isinstance(knobs_delta, dict) else {},
+    if data.get("action") == "stop":
+        return NoMove(str(data.get("stop_reason") or "no_direction"))
+
+    suggest = data.get("suggest_axes")
+    suggest_axes = (
+        sanitize_axes({str(k): str(v) for k, v in suggest.items()})
+        if isinstance(suggest, dict)
+        else {}
+    )
+    knobs_raw = data.get("knobs")
+    knobs: dict[str, Any] = dict(knobs_raw) if isinstance(knobs_raw, dict) else {}
+    return Gradient(
+        suggest_axes=suggest_axes,
+        knobs=knobs,
         rationale=str(data.get("rationale", "")),
         bottleneck=str(data.get("bottleneck", "")),
-        stop_reason=str(data.get("stop_reason", "")),
     )
