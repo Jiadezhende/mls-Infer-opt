@@ -38,11 +38,12 @@ loop     = trainer  驱动循环、keep-best、判停、发布
 | 模块 | 训练类比 | 当前职责 |
 |------|----------|----------|
 | `loop/` | trainer | 建 `TaskContext`、驱动 bootstrap/每轮优化、keep-best、执行判停、finalize 发布与 artifacts。唯一发布出口。 |
-| `generate/` | train | 产候选：`bootstrap` 保守 baseline、`propose` 按 `Policy` 生成优化候选、`repair` 按错误修复候选。 |
+| `generate/` | train | 产候选：`bootstrap` 保守 baseline、`propose` 按 `Gradient`（松建议）生成优化候选、`repair` 按错误修复候选。agent 在搜索维度界内自由探索，不被建议定点约束。 |
 | `evaluate/` | eval | 权威 correctness gate + benchmark。只通过 gate 的候选才有 bench 和 score。 |
-| `analyze/` | grad | 汇总 `LoopState` 态势，给出下一步 `Policy` 或 `NoMove`（不判停）。LLM 是唯一方向源：不可用 → `NoMove("llm_unavailable")`；内容失败重试一次仍败 → `NoMove("llm_content_failure")`；C2 穿透。 |
+| `analyze/` | grad | 汇总 `LoopState` 态势，给出下一步 `Gradient` 或 `NoMove`（不判停）。LLM 是唯一方向源：不可用 → `NoMove("llm_unavailable")`；内容失败重试一次仍败 → `NoMove("llm_content_failure")`；C2 穿透。 |
 | `llm/` | 基建 | generate/analyze 共用的 LLM 客户端与 fake/test double。不可用时暴露 `available=False` 或返回空。 |
-| `state/` | 基建 | 共享数据契约：`TaskContext`、`LoopState`、`Candidate`、`Policy`、`GateResult`、`BenchResult`、事件流。 |
+| `searchspace/` | 基建 | 搜索维度唯一真相源（`space`）+ 围着它转的纯函数：`dims`（词表闸 / 标签 / 渲 prompt 菜单）、`compat`（轴间依赖规则 → prompt 文本）。analyze 与 generate 共用、互不横向 import。 |
+| `state/` | 基建 | 共享数据契约：`TaskContext`、`LoopState`、`Candidate`、`Gradient`、`GateResult`、`BenchResult`、事件流。 |
 
 ## 3. 一次运行的完整流程
 
@@ -51,17 +52,17 @@ flowchart TD
     INIT["loop.build_task_context / agent 装配 TaskContext"] --> BOOT["generate.bootstrap(ctx)"]
     BOOT --> BEVAL["evaluate(candidate, ctx, full)"]
     BEVAL --> BKEEP["loop.keep_best: baseline 成为兜底 best"]
-    BKEEP --> ROUND{"loop.run_loop 每轮"}
-    ROUND --> ANALYZE["analyze(state): stop 或 next Policy"]
-    ANALYZE -->|stop| FIN["loop.finalize"]
-    ANALYZE -->|Policy| GEN["generate.propose(ctx, policy, best_code, llm)"]
+    BKEEP --> ROUND{"loop.run_loop 每轮：先查 hard_stop_reason"}
+    ROUND --> ANALYZE["analyze(state): Gradient 或 NoMove"]
+    ANALYZE -->|NoMove| FIN["loop.finalize"]
+    ANALYZE -->|Gradient| GEN["generate.propose(ctx, gradient, best_code, llm)"]
     GEN -->|None| STALE["本轮无收益 stale_rounds += 1"]
     GEN -->|Candidate| EVAL["evaluate(candidate, ctx, full)"]
     EVAL --> KEEP["loop.keep_best: gate passed 且 score 严格更高才提升"]
     KEEP -->|提升| ROUND
     KEEP -->|未提升且 gate passed| STALE
     KEEP -->|gate failed| REPAIR{"max_repair_retries > 0"}
-    REPAIR -->|是| FIX["generate.repair(ctx, policy, failed_code, errors, llm)"]
+    REPAIR -->|是| FIX["generate.repair(ctx, gradient, failed_code, errors, llm)"]
     FIX --> EVAL
     REPAIR -->|否| STALE
     STALE --> ROUND
@@ -74,9 +75,11 @@ flowchart TD
 2. 调 `generate.bootstrap(ctx)` 产 baseline 候选。
 3. 调 `evaluate(..., "full")` 做权威评测。
 4. `keep_best` 只接受 `gate.passed` 且 score 严格更高的候选；baseline 通过后成为永久兜底。
-5. 每轮先调 `analyze(state)`：
-   - 若返回 `None`，loop 读取最近一条 analyze stop event 的 `stop_reason`，进入 finalize。
-   - 若返回 `Policy`，loop 从当前 best 的候选目录读 `engine.py`，传给 `generate.propose`。
+5. 每轮顶部先查 `hard_stop_reason(state)`（预算 / 轮数 / 连续无提升）；未触发则调 `analyze(state)`：
+   - 若返回 `NoMove`，loop 把 `NoMove.reason` 写进 `stop_reason`，进入 finalize（停止由总控裁决，
+     不走事件侧信道）。
+   - 若返回 `Gradient`，loop 从当前 best 的候选目录读 `engine.py`，连同 gradient（松建议 +
+     rationale）传给 `generate.propose`。
 6. propose 成功后再次 full evaluate，再用 `keep_best` 决定是否提升。
 7. 若候选没过 gate，loop 可按 `TaskContext.limits.max_repair_retries` 调 `generate.repair`，把
    结构化 `ValidationError` 回灌给 generate。
@@ -120,21 +123,23 @@ Candidate
   ├─ gate: GateResult | None
   └─ bench: BenchResult | None
 
-Policy
-  ├─ axes / knobs
+Gradient
+  ├─ suggest_axes / knobs   # 相对 best 的松建议（已过词表闸 sanitize，不定点）
   ├─ kind / round / parent_id
-  └─ rationale: analyze 给 generate 的方向提示
+  └─ bottleneck / rationale: analyze 给 generate 的瓶颈与方向提示
 ```
 
-候选源码和完整 policy 不常驻内存，落在候选目录：
+`Gradient` 刻意不是搜索空间里的恒合法定点：`suggest_axes` 只是优先方向，generate 的 agent 看完整
+搜索维度自由探索，外层 full gate 才是唯一权威。候选源码与 agent 自述的实际采用落在候选目录：
 
 ```text
 runs/{run_id}/candidates/{candidate_id}/engine.py
-runs/{run_id}/candidates/{candidate_id}/policy.json
+runs/{run_id}/candidates/{candidate_id}/applied.json   # agent 回报的实际 axes/knobs + 本轮 rationale，留档审计
 ```
 
-`Candidate.strategy_tags` 只是轻量摘要，供 analyze/report 快速看当前 best 应用了哪些非默认轴。
-完整的 `Policy` 以 `policy.json` 为准。
+`Candidate.strategy_tags` 是轻量摘要，**取自 agent 过门时如实回报的 `applied_axes`**（过 `sanitize_axes`
+词表闸 + 去默认），不再来自 analyze 下发的定点——这是 honest tags 的咽喉点（见 [[agentic-generate]]）。
+agent 没回报 / 走回退文本路径则空 tags（诚实「未报」）。不再写 `policy.json`（已无恒合法定点）。
 
 ## 5. 模块内部分层
 
@@ -147,22 +152,32 @@ runs/{run_id}/candidates/{candidate_id}/policy.json
 - `finalize(state, ...)`：唯一发布出口。只有当前 best 且 gate passed 才复制到
   `workspace/engine.py`，并同步留档到 `runs/{run_id}/final/engine.py`。
 
+### searchspace
+
+搜索维度的共享层，analyze 与 generate 都依赖、互不横向 import。
+
+- `space.py`：搜索维度（轴/选项/knobs/组件/敏感度）的唯一真相源。
+- `dims.py`：围着 `space` 转的纯函数——`sanitize_axes`（词表闸，过滤到已知轴+合法选项、不填默认）、
+  `strategy_tags` / `grouped_axes`（标签与分组）、`render_search_dims`（渲成 prompt 菜单）。不定点、不落盘、零 torch。
+- `compat.py`：轴间依赖规则——`CONSTRAINTS`/`Requires` + `render_constraints`（渲成 prompt 规则文本）。
+  非法组合由外层 full gate 拦下，此处不再自动降级消解（`resolve`/`validate`/`Violation` 已删）。
+
 ### analyze
 
-- `situation.py`：从 `LoopState` 汇总 ephemeral `Situation`。
-- `prompt.py`：构造 LLM 诊断 prompt，把 LLM JSON 回复解析成 `Decision`，并定义 `Decision`/`Action` 类型。
-- `grad.py`：主入口 `analyze(state, llm=None)`，返回下一个 `Policy` 或 `NoMove`。LLM 是唯一方向源（不可用/内容失败 → `NoMove`，C2 穿透）。
+- `situation.py`：从 `LoopState` 汇总 ephemeral `Situation`；`best_axes` 由 best 的 honest `strategy_tags` 还原。
+- `prompt.py`：构造 LLM 诊断 prompt（注入搜索维度菜单 + 依赖规则 + best + 历史 + 预算），`parse_gradient`
+  把 LLM JSON 回复解析成 `Gradient`（`suggest_axes` 过词表闸）或 `NoMove`。单次调用 + 确定性解析，不走 tool-loop。
+- `grad.py`：主入口 `analyze(state, llm=None)`，返回下一个 `Gradient` 或 `NoMove`。LLM 是唯一方向源（不可用/内容失败 → `NoMove`，C2 穿透）。
 
 ### generate
 
-- `space.py`：搜索空间轴/选项/knobs 的唯一真相源。
-- `policy.py`：`aggregate/merge`，把任意 axes/knobs 收敛成合法 `Policy`。
-- `codegen.py`：`bootstrap/propose/repair`，生成候选并落盘。
-- `compat.py`：消解非法策略组合。
-- `prompt.py`：把 `Policy` 和错误反馈渲成生成 prompt。
+- `codegen.py`：`bootstrap/propose/repair`，生成候选并落盘。`bootstrap` 产不依赖 LLM 的 baseline；
+  `propose`/`repair` 按 `Gradient` 驱动 LLM。过门时连 agent 回报的 `applied_axes/applied_knobs` 一起 capture，
+  `strategy_tags` 取自该回报（honest）、并写 `applied.json` 留档。
+- `prompt.py`：把 `Gradient`（松建议 + rationale）和错误反馈渲成生成 prompt，注入完整搜索维度 + 依赖规则。
 
-当前 `codegen.py` 是“LLM 生成代码 + 静态检查 + quick gate 自检重试”的实现；后续如迁移到真正
-tool-loop，loop 的外层契约不需要变：它仍只接收 `Candidate | None`，并只信外层 full evaluate。
+当前 `codegen.py` 把 `check_engine` 自检工具交给模型边写边自检（`run_agent` tool-loop）；loop 的外层
+契约不依赖其内部形态：它仍只接收 `Candidate | None`，并只信外层 full evaluate（见 [[agentic-generate]]）。
 
 ### evaluate
 
@@ -177,7 +192,7 @@ tool-loop，loop 的外层契约不需要变：它仍只接收 `Candidate | None
 2. **永远保留已验证 best**。新候选失败、LLM 失败、analyze 停止，都不能让最终产物退化或缺失。
 3. **keep-best 必须严格更优**。通过 gate 只是入场资格，score 必须大于当前 `best_score` 才提升。
 4. **deterministic 外层 + LLM 内层**。发布、选优、权威验证都在 loop/evaluate；LLM 只提出方向或代码。
-5. **generate/analyze 无发布权**。它们只能产 `Candidate | None` 或 `Policy | None`。
+5. **generate/analyze 无发布权**。它们只能产 `Candidate | None` 或 `Gradient | NoMove`。
 6. **事件流 append-only**。模块结论进入 `LoopState.events`，report/output 从 state 派生。
 
 ## 7. 当前已实现与待接线
@@ -185,7 +200,8 @@ tool-loop，loop 的外层契约不需要变：它仍只接收 `Candidate | None
 已实现：
 
 - `analyze` 分层与测试。
-- `generate` 搜索空间、policy 聚合、候选落盘、bootstrap/propose/repair。
+- `searchspace` 搜索维度真相源 + 词表闸/标签/菜单（`dims`）+ 依赖规则（`compat`），analyze/generate 共用。
+- `generate` 候选落盘、bootstrap/propose/repair；`strategy_tags` 取自 agent honest 回报。
 - `evaluate` gate/bench 子进程隔离。
 - `loop.trainer` 第一版可执行状态机、keep-best、repair 调度、finalize 发布、artifact 落盘
   （workspace 对外交付 engine.py+output3.json；runs/{run_id} 留档审计快照、results.log、report.json）。
